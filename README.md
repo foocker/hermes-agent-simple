@@ -15,7 +15,7 @@ Requirements:
 From this checkout:
 
 ```bash
-cd /home/gg/hermes-agent-simple
+cd ~/hermes-agent-simple
 
 # Install Python dependencies and create .venv.
 uv sync --all-extras
@@ -31,7 +31,7 @@ If `hermes` is not available outside the virtualenv, create a user-level symlink
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sf /home/gg/hermes-agent-simple/.venv/bin/hermes ~/.local/bin/hermes
+ln -sf ~/hermes-agent-simple/.venv/bin/hermes ~/.local/bin/hermes
 ```
 
 Make sure `~/.local/bin` is on `PATH` if your shell does not already include it.

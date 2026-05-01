@@ -12,6 +12,8 @@ from agent.auxiliary_client import call_llm
 
 logger = logging.getLogger(__name__)
 
+
+
 # Callback signature: (task_name, exception) -> None. Used to surface
 # auxiliary failures to the user through AIAgent._emit_auxiliary_failure
 # so silent-drops (e.g. OpenRouter 402 exhausting the fallback chain)
