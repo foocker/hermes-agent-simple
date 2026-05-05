@@ -15,8 +15,8 @@ Features:
 
 Usage:
     from run_agent import AIAgent
-    
-    agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
+
+    agent = AIAgent(base_url="http://localhost:30000/v1", model="gpt-5-mini")
     response = agent.run_conversation("Tell me about the latest Python updates")
 """
 
@@ -1300,7 +1300,7 @@ class AIAgent:
             api_key (str): API key for authentication (optional, uses env var if not provided)
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
-            model (str): Model name to use (default: "anthropic/claude-opus-4.6")
+            model (str): Model name to use.
             max_iterations (int): Maximum number of tool calling iterations (default: 90)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
@@ -1325,9 +1325,9 @@ class AIAgent:
             prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
                 Useful for injecting a few-shot example or priming the model's response style.
                 Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
-                NOTE: Anthropic Sonnet 4.6+ and Opus 4.6+ reject a conversation that ends on an
-                assistant-role message (400 error).  For those models use structured outputs or
-                output_config.format instead of a trailing-assistant prefill.
+                NOTE: Some strict APIs reject a conversation that ends on an
+                assistant-role message. For those models use structured outputs
+                or output_config.format instead of a trailing-assistant prefill.
             platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
                 Used to inject platform-specific formatting hints into the system prompt.
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
@@ -1609,15 +1609,13 @@ class AIAgent:
         self._persist_user_message_idx = None
         self._persist_user_message_override = None
 
-        # Cache anthropic image-to-text fallbacks per image payload/URL so a
+        # Cache image-to-text fallbacks per image payload/URL so a
         # single tool loop does not repeatedly re-run auxiliary vision on the
         # same image history.
-        self._anthropic_image_fallback_cache: Dict[str, str] = {}
+        self._image_text_fallback_cache: Dict[str, str] = {}
 
         # Initialize the OpenAI-compatible client. The simple distribution
         # supports Chat Completions plus Responses API through the same SDK.
-        self._anthropic_client = None
-        self._is_anthropic_oauth = False
 
         # Resolve per-provider / per-model request timeout once up front so
         # every client construction path applies it consistently.
@@ -1781,12 +1779,7 @@ class AIAgent:
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
-            if self._use_native_cache_layout and self.provider == "anthropic":
-                source = "native Anthropic"
-            elif self._use_native_cache_layout:
-                source = "Anthropic-compatible endpoint"
-            else:
-                source = "Claude via OpenRouter"
+            source = "provider cache"
             print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
@@ -4028,7 +4021,7 @@ class AIAgent:
                 parts.append(f"Ray {ray_id}")
             return " — ".join(parts)
 
-        # JSON body errors from OpenAI/Anthropic SDKs
+        # JSON body errors from OpenAI-compatible SDKs
         body = getattr(error, "body", None)
         if isinstance(body, dict):
             msg = body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
@@ -5941,47 +5934,6 @@ class AIAgent:
 
         return True
 
-    def _try_refresh_nous_client_credentials(self, *, force: bool = True) -> bool:
-        if self.api_mode != "chat_completions" or self.provider != "nous":
-            return False
-
-        try:
-            from hermes_cli.auth import resolve_nous_runtime_credentials
-
-            creds = resolve_nous_runtime_credentials(
-                min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
-                timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
-                force_mint=force,
-            )
-        except Exception as exc:
-            logger.debug("Nous credential refresh failed: %s", exc)
-            return False
-
-        api_key = creds.get("api_key")
-        base_url = creds.get("base_url")
-        if not isinstance(api_key, str) or not api_key.strip():
-            return False
-        if not isinstance(base_url, str) or not base_url.strip():
-            return False
-
-        self.api_key = api_key.strip()
-        self.base_url = base_url.strip().rstrip("/")
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-        # Nous requests should not inherit OpenRouter-only attribution headers.
-        self._client_kwargs.pop("default_headers", None)
-
-        if not self._replace_primary_openai_client(reason="nous_credential_refresh"):
-            return False
-
-        return True
-
-    def _try_refresh_copilot_client_credentials(self) -> bool:
-        return False
-
-    def _try_refresh_anthropic_client_credentials(self) -> bool:
-        return False
-
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
         from agent.auxiliary_client import _AI_GATEWAY_HEADERS, _OR_HEADERS
 
@@ -6033,8 +5985,7 @@ class AIAgent:
         `classified_reason` lets the recovery path honor the structured error
         classifier instead of relying only on raw HTTP codes. This matters for
         providers that surface billing/rate-limit/auth conditions under a
-        different status code, such as Anthropic returning HTTP 400 for
-        "out of extra usage".
+        different status code.
         """
         pool = self._credential_pool
         if pool is None:
@@ -6097,9 +6048,6 @@ class AIAgent:
                 return True, False
 
         return False, has_retried_429
-
-    def _rebuild_anthropic_client(self) -> None:
-        return None
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """
@@ -6653,63 +6601,6 @@ class AIAgent:
                 usage=usage_obj,
             )
 
-        def _call_anthropic():
-            """Stream an Anthropic Messages API response.
-
-            Fires delta callbacks for real-time token delivery, but returns
-            the native Anthropic Message object from get_final_message() so
-            the rest of the agent loop (validation, tool extraction, etc.)
-            works unchanged.
-            """
-            has_tool_use = False
-
-            # Reset stale-stream timer for this attempt
-            last_chunk_time["t"] = time.time()
-            # Use the Anthropic SDK's streaming context manager
-            with self._anthropic_client.messages.stream(**api_kwargs) as stream:
-                for event in stream:
-                    # Update stale-stream timer on every event so the
-                    # outer poll loop knows data is flowing.  Without
-                    # this, the detector kills healthy long-running
-                    # Opus streams after 180 s even when events are
-                    # actively arriving (the chat_completions path
-                    # already does this at the top of its chunk loop).
-                    last_chunk_time["t"] = time.time()
-                    self._touch_activity("receiving stream response")
-
-                    if self._interrupt_requested:
-                        break
-
-                    event_type = getattr(event, "type", None)
-
-                    if event_type == "content_block_start":
-                        block = getattr(event, "content_block", None)
-                        if block and getattr(block, "type", None) == "tool_use":
-                            has_tool_use = True
-                            tool_name = getattr(block, "name", None)
-                            if tool_name:
-                                _fire_first_delta()
-                                self._fire_tool_gen_started(tool_name)
-
-                    elif event_type == "content_block_delta":
-                        delta = getattr(event, "delta", None)
-                        if delta:
-                            delta_type = getattr(delta, "type", None)
-                            if delta_type == "text_delta":
-                                text = getattr(delta, "text", "")
-                                if text and not has_tool_use:
-                                    _fire_first_delta()
-                                    self._fire_stream_delta(text)
-                                    deltas_were_sent["yes"] = True
-                            elif delta_type == "thinking_delta":
-                                thinking_text = getattr(delta, "thinking", "")
-                                if thinking_text:
-                                    _fire_first_delta()
-                                    self._fire_reasoning_delta(thinking_text)
-
-                # Return the native Anthropic Message for downstream processing
-                return stream.get_final_message()
-
         def _call():
             import httpx as _httpx
 
@@ -7193,14 +7084,14 @@ class AIAgent:
             except Exception:
                 pass
 
-            # Determine api_mode from provider / base URL / model
+            # Determine api_mode from provider / base URL / model.
+            # Hermes Simple supports only OpenAI-compatible Chat Completions
+            # and Responses API.
             fb_api_mode = "chat_completions"
             fb_base_url = str(fb_client.base_url)
             _fb_is_azure = self._is_azure_openai_url(fb_base_url)
             if fb_provider == "openai-codex":
                 fb_api_mode = "codex_responses"
-            elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
-                fb_api_mode = "anthropic_messages"
             elif _fb_is_azure:
                 # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
                 # support the Responses API. Stay on chat_completions.
@@ -7211,15 +7102,8 @@ class AIAgent:
                 fb_model,
                 provider=fb_provider,
             ):
-                # GPT-5.x models usually need Responses API, but keep
-                # provider-specific exceptions like Copilot gpt-5-mini on
-                # chat completions.
+                # GPT-5.x models usually need Responses API.
                 fb_api_mode = "codex_responses"
-            elif fb_provider == "bedrock" or (
-                base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
-                and base_url_host_matches(fb_base_url, "amazonaws.com")
-            ):
-                fb_api_mode = "bedrock_converse"
 
             old_model = self.model
             self.model = fb_model
@@ -7235,45 +7119,27 @@ class AIAgent:
             # SDK default.
             _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
-            if fb_api_mode == "anthropic_messages":
-                # Build native Anthropic client instead of using OpenAI client
-                from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-                effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
-                self.api_key = effective_key
-                self._anthropic_api_key = effective_key
-                self._anthropic_base_url = fb_base_url
-                self._anthropic_client = build_anthropic_client(
-                    effective_key, self._anthropic_base_url, timeout=_fb_timeout,
-                )
-                self._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
-                self.client = None
-                self._client_kwargs = {}
-            else:
-                # Swap OpenAI client and config in-place
-                self.api_key = fb_client.api_key
-                self.client = fb_client
-                # Preserve provider-specific headers that
-                # resolve_provider_client() may have baked into
-                # fb_client via the default_headers kwarg.  The OpenAI
-                # SDK stores these in _custom_headers.  Without this,
-                # subsequent request-client rebuilds (via
-                # _create_request_openai_client) drop the headers,
-                # causing 403s from providers like Kimi Coding that
-                # require a User-Agent sentinel.
-                fb_headers = getattr(fb_client, "_custom_headers", None)
-                if not fb_headers:
-                    fb_headers = getattr(fb_client, "default_headers", None)
-                self._client_kwargs = {
-                    "api_key": fb_client.api_key,
-                    "base_url": fb_base_url,
-                    **({"default_headers": dict(fb_headers)} if fb_headers else {}),
-                }
-                if _fb_timeout is not None:
-                    self._client_kwargs["timeout"] = _fb_timeout
-                    # Rebuild the shared OpenAI client so the configured
-                    # timeout takes effect on the very next fallback request,
-                    # not only after a later credential-rotation rebuild.
-                    self._replace_primary_openai_client(reason="fallback_timeout_apply")
+            # Swap OpenAI client and config in-place.
+            self.api_key = fb_client.api_key
+            self.client = fb_client
+            # Preserve provider-specific headers that
+            # resolve_provider_client() may have baked into
+            # fb_client via the default_headers kwarg. The OpenAI
+            # SDK stores these in _custom_headers.
+            fb_headers = getattr(fb_client, "_custom_headers", None)
+            if not fb_headers:
+                fb_headers = getattr(fb_client, "default_headers", None)
+            self._client_kwargs = {
+                "api_key": fb_client.api_key,
+                "base_url": fb_base_url,
+                **({"default_headers": dict(fb_headers)} if fb_headers else {}),
+            }
+            if _fb_timeout is not None:
+                self._client_kwargs["timeout"] = _fb_timeout
+                # Rebuild the shared OpenAI client so the configured
+                # timeout takes effect on the very next fallback request,
+                # not only after a later credential-rotation rebuild.
+                self._replace_primary_openai_client(reason="fallback_timeout_apply")
 
             # Re-evaluate prompt caching for the new provider/model
             self._use_prompt_caching, self._use_native_cache_layout = (
@@ -7358,26 +7224,15 @@ class AIAgent:
             # native-vs-proxy split (older sessions saved before this PR).
             self._use_native_cache_layout = rt.get(
                 "use_native_cache_layout",
-                self.api_mode == "anthropic_messages" and self.provider == "anthropic",
+                False,
             )
 
             # ── Rebuild client for the primary provider ──
-            if self.api_mode == "anthropic_messages":
-                from agent.anthropic_adapter import build_anthropic_client
-                self._anthropic_api_key = rt["anthropic_api_key"]
-                self._anthropic_base_url = rt["anthropic_base_url"]
-                self._anthropic_client = build_anthropic_client(
-                    rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
-                )
-                self._is_anthropic_oauth = rt["is_anthropic_oauth"]
-                self.client = None
-            else:
-                self.client = self._create_openai_client(
-                    dict(rt["client_kwargs"]),
-                    reason="restore_primary",
-                    shared=True,
-                )
+            self.client = self._create_openai_client(
+                dict(rt["client_kwargs"]),
+                reason="restore_primary",
+                shared=True,
+            )
 
             # ── Restore context engine state ──
             cc = self.context_compressor
@@ -7417,11 +7272,10 @@ class AIAgent:
 
         After ``max_retries`` exhaust, rebuild the primary client (clearing
         stale connection pools) and give it one more attempt before falling
-        back.  This is most useful for direct endpoints (custom, Z.AI,
-        Anthropic, OpenAI, local models) where a TCP-level hiccup does not
-        mean the provider is down.
+        back. This is most useful for direct endpoints (custom, OpenAI, local
+        models) where a TCP-level hiccup does not mean the provider is down.
 
-        Skipped for proxy/aggregator providers (OpenRouter, Nous) which
+        Skipped for proxy/aggregator providers (OpenRouter) which
         already manage connection pools and retries server-side — if our
         retries through them are exhausted, one more rebuilt client won't help.
         """
@@ -7436,10 +7290,6 @@ class AIAgent:
         # Skip for aggregator providers — they manage their own retry infra
         if self._is_openrouter_url():
             return False
-        provider_lower = (self.provider or "").strip().lower()
-        if provider_lower in ("nous", "nous-research"):
-            return False
-
         try:
             # Close existing client to release stale connections
             if getattr(self, "client", None) is not None:
@@ -7461,22 +7311,11 @@ class AIAgent:
                 self._transport_cache.clear()
             self.api_key = rt["api_key"]
 
-            if self.api_mode == "anthropic_messages":
-                from agent.anthropic_adapter import build_anthropic_client
-                self._anthropic_api_key = rt["anthropic_api_key"]
-                self._anthropic_base_url = rt["anthropic_base_url"]
-                self._anthropic_client = build_anthropic_client(
-                    rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
-                )
-                self._is_anthropic_oauth = rt["is_anthropic_oauth"]
-                self.client = None
-            else:
-                self.client = self._create_openai_client(
-                    dict(rt["client_kwargs"]),
-                    reason="primary_recovery",
-                    shared=True,
-                )
+            self.client = self._create_openai_client(
+                dict(rt["client_kwargs"]),
+                reason="primary_recovery",
+                shared=True,
+            )
 
             wait_time = min(3 + retry_count, 8)
             self._vprint(
