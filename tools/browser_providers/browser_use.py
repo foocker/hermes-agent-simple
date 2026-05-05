@@ -9,9 +9,6 @@ from typing import Any, Dict, Optional
 import requests
 
 from tools.browser_providers.base import CloudBrowserProvider
-from tools.managed_tool_gateway import resolve_managed_tool_gateway
-from tools.tool_backend_helpers import managed_nous_tools_enabled, prefers_gateway
-
 logger = logging.getLogger(__name__)
 _pending_create_keys: Dict[str, str] = {}
 _pending_create_keys_lock = threading.Lock()
@@ -70,40 +67,24 @@ class BrowserUseProvider(CloudBrowserProvider):
         return self._get_config_or_none() is not None
 
     # ------------------------------------------------------------------
-    # Config resolution (direct API key OR managed Nous gateway)
+    # Config resolution
     # ------------------------------------------------------------------
 
     def _get_config_or_none(self) -> Optional[Dict[str, Any]]:
         api_key = os.environ.get("BROWSER_USE_API_KEY")
-        if api_key and not prefers_gateway("browser"):
+        if api_key:
             return {
                 "api_key": api_key,
                 "base_url": _BASE_URL,
                 "managed_mode": False,
             }
 
-        managed = resolve_managed_tool_gateway("browser-use")
-        if managed is None:
-            return None
-
-        return {
-            "api_key": managed.nous_user_token,
-            "base_url": managed.gateway_origin.rstrip("/"),
-            "managed_mode": True,
-        }
+        return None
 
     def _get_config(self) -> Dict[str, Any]:
         config = self._get_config_or_none()
         if config is None:
-            message = (
-                "Browser Use requires a direct BROWSER_USE_API_KEY credential."
-            )
-            if managed_nous_tools_enabled():
-                message = (
-                    "Browser Use requires either a direct BROWSER_USE_API_KEY "
-                    "credential or a managed Browser Use gateway configuration."
-                )
-            raise ValueError(message)
+            raise ValueError("Browser Use requires a direct BROWSER_USE_API_KEY credential.")
         return config
 
     # ------------------------------------------------------------------

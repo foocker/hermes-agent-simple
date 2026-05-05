@@ -394,11 +394,8 @@ def run_doctor(args):
                 "custom",
                 "auto",
                 "ai-gateway",
-                "kilocode",
-                "opencode-zen",
-                "huggingface",
-                "lmstudio",
-                "nous",
+                "openrouter",
+                "ai-gateway",
             }
             if (
                 default_model
@@ -417,7 +414,7 @@ def run_doctor(args):
 
             # Check credentials for the configured provider.
             # Limit to API-key providers in PROVIDER_REGISTRY — other provider
-            # types (OAuth, SDK, openrouter/anthropic/custom/auto) have their
+            # types (OAuth, OpenRouter/custom/auto) have their
             # own env-var checks elsewhere in doctor, and get_auth_status()
             # returns a bare {logged_in: False} for anything it doesn't
             # explicitly dispatch, which would produce false positives.
@@ -543,19 +540,7 @@ def run_doctor(args):
     print(color("◆ Auth Providers", Colors.CYAN, Colors.BOLD))
 
     try:
-        from hermes_cli.auth import (
-            get_nous_auth_status,
-            get_codex_auth_status,
-            get_gemini_oauth_auth_status,
-            get_minimax_oauth_auth_status,
-        )
-
-        nous_status = get_nous_auth_status()
-        if nous_status.get("logged_in"):
-            check_ok("Nous Portal auth", "(logged in)")
-        else:
-            check_warn("Nous Portal auth", "(not logged in)")
-
+        from hermes_cli.auth import get_codex_auth_status
         codex_status = get_codex_auth_status()
         if codex_status.get("logged_in"):
             check_ok("OpenAI Codex auth", "(logged in)")
@@ -564,26 +549,6 @@ def run_doctor(args):
             if codex_status.get("error"):
                 check_info(codex_status["error"])
 
-        gemini_status = get_gemini_oauth_auth_status()
-        if gemini_status.get("logged_in"):
-            email = gemini_status.get("email") or ""
-            project = gemini_status.get("project_id") or ""
-            pieces = []
-            if email:
-                pieces.append(email)
-            if project:
-                pieces.append(f"project={project}")
-            suffix = f" ({', '.join(pieces)})" if pieces else ""
-            check_ok("Google Gemini OAuth", f"(logged in{suffix})")
-        else:
-            check_warn("Google Gemini OAuth", "(not logged in)")
-
-        minimax_status = get_minimax_oauth_auth_status()
-        if minimax_status.get("logged_in"):
-            region = minimax_status.get("region", "global")
-            check_ok("MiniMax OAuth", f"(logged in, region={region})")
-        else:
-            check_warn("MiniMax OAuth", "(not logged in)")
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
 
@@ -1025,82 +990,11 @@ def run_doctor(args):
     else:
         check_warn("OpenRouter API", "(not configured)")
     
-    from hermes_cli.auth import get_anthropic_key
-    anthropic_key = get_anthropic_key()
-    if anthropic_key:
-        print("  Checking Anthropic API...", end="", flush=True)
-        try:
-            import httpx
-            from agent.anthropic_adapter import (
-                _is_oauth_token,
-                _COMMON_BETAS,
-                _OAUTH_ONLY_BETAS,
-                _CONTEXT_1M_BETA,
-            )
-
-            headers = {"anthropic-version": "2023-06-01"}
-            is_oauth = _is_oauth_token(anthropic_key)
-            if is_oauth:
-                headers["Authorization"] = f"Bearer {anthropic_key}"
-                headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
-            else:
-                headers["x-api-key"] = anthropic_key
-            response = httpx.get(
-                "https://api.anthropic.com/v1/models",
-                headers=headers,
-                timeout=10
-            )
-            # Reactive recovery: OAuth subscriptions that don't include 1M
-            # context reject the request with 400 "long context beta is not
-            # yet available for this subscription". Retry once with that
-            # beta stripped so the doctor check doesn't falsely report the
-            # Anthropic API as unreachable for those users.
-            if (
-                is_oauth
-                and response.status_code == 400
-                and "long context beta" in response.text.lower()
-                and "not yet available" in response.text.lower()
-            ):
-                headers["anthropic-beta"] = ",".join(
-                    [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA] + list(_OAUTH_ONLY_BETAS)
-                )
-                response = httpx.get(
-                    "https://api.anthropic.com/v1/models",
-                    headers=headers,
-                    timeout=10,
-                )
-            if response.status_code == 200:
-                print(f"\r  {color('✓', Colors.GREEN)} Anthropic API                           ")
-            elif response.status_code == 401:
-                print(f"\r  {color('✗', Colors.RED)} Anthropic API {color('(invalid API key)', Colors.DIM)}                 ")
-            else:
-                msg = "(couldn't verify)"
-                print(f"\r  {color('⚠', Colors.YELLOW)} Anthropic API {color(msg, Colors.DIM)}                 ")
-        except Exception as e:
-            print(f"\r  {color('⚠', Colors.YELLOW)} Anthropic API {color(f'({e})', Colors.DIM)}                 ")
-
     # -- API-key providers --
     # Tuple: (name, env_vars, default_url, base_env, supports_models_endpoint)
     # If supports_models_endpoint is False, we skip the health check and just show "configured"
     _apikey_providers = [
-        ("Z.AI / GLM",      ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"), "https://api.z.ai/api/paas/v4/models", "GLM_BASE_URL", True),
-        ("Kimi / Moonshot",  ("KIMI_API_KEY",),                              "https://api.moonshot.ai/v1/models",   "KIMI_BASE_URL", True),
-        ("StepFun Step Plan",   ("STEPFUN_API_KEY",),                           "https://api.stepfun.ai/step_plan/v1/models", "STEPFUN_BASE_URL", True),
-        ("Kimi / Moonshot (China)", ("KIMI_CN_API_KEY",),                    "https://api.moonshot.cn/v1/models",   None, True),
-        ("Arcee AI",         ("ARCEEAI_API_KEY",),                            "https://api.arcee.ai/api/v1/models",  "ARCEE_BASE_URL", True),
-        ("GMI Cloud",        ("GMI_API_KEY",),                                "https://api.gmi-serving.com/v1/models", "GMI_BASE_URL", True),
-        ("DeepSeek",         ("DEEPSEEK_API_KEY",),                           "https://api.deepseek.com/v1/models",  "DEEPSEEK_BASE_URL", True),
-        ("Hugging Face",     ("HF_TOKEN",),                                   "https://router.huggingface.co/v1/models", "HF_BASE_URL", True),
-        ("NVIDIA NIM",       ("NVIDIA_API_KEY",),                             "https://integrate.api.nvidia.com/v1/models", "NVIDIA_BASE_URL", True),
-        ("Alibaba/DashScope", ("DASHSCOPE_API_KEY",),                         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models", "DASHSCOPE_BASE_URL", True),
-        # MiniMax: the /anthropic endpoint doesn't support /models, but the /v1 endpoint does.
-        ("MiniMax",          ("MINIMAX_API_KEY",),                            "https://api.minimax.io/v1/models",    "MINIMAX_BASE_URL", True),
-        ("MiniMax (China)",  ("MINIMAX_CN_API_KEY",),                         "https://api.minimaxi.com/v1/models",  "MINIMAX_CN_BASE_URL", True),
-        ("Vercel AI Gateway",       ("AI_GATEWAY_API_KEY",),                          "https://ai-gateway.vercel.sh/v1/models", "AI_GATEWAY_BASE_URL", True),
-        ("Kilo Code",        ("KILOCODE_API_KEY",),                            "https://api.kilo.ai/api/gateway/models",  "KILOCODE_BASE_URL", True),
-        ("OpenCode Zen",     ("OPENCODE_ZEN_API_KEY",),                        "https://opencode.ai/zen/v1/models",  "OPENCODE_ZEN_BASE_URL", True),
-        # OpenCode Go has no shared /models endpoint; skip the health check.
-        ("OpenCode Go",      ("OPENCODE_GO_API_KEY",),                         None,                                  "OPENCODE_GO_BASE_URL", False),
+        ("Vercel AI Gateway", ("AI_GATEWAY_API_KEY",), "https://ai-gateway.vercel.sh/v1/models", "AI_GATEWAY_BASE_URL", True),
     ]
     for _pname, _env_vars, _default_url, _base_env, _supports_health_check in _apikey_providers:
         _key = ""
@@ -1118,25 +1012,11 @@ def run_doctor(args):
             try:
                 import httpx
                 _base = os.getenv(_base_env, "") if _base_env else ""
-                # Auto-detect Kimi Code keys (sk-kimi-) → api.kimi.com/coding/v1
-                # (OpenAI-compat surface, which exposes /models for health check).
-                if not _base and _key.startswith("sk-kimi-"):
-                    _base = "https://api.kimi.com/coding/v1"
-                # Anthropic-compat endpoints (/anthropic, api.kimi.com/coding
-                # with no /v1) don't support /models.  Rewrite to the OpenAI-compat
-                # /v1 surface for health checks.
-                if _base and _base.rstrip("/").endswith("/anthropic"):
-                    from agent.auxiliary_client import _to_openai_base_url
-                    _base = _to_openai_base_url(_base)
-                if base_url_host_matches(_base, "api.kimi.com") and _base.rstrip("/").endswith("/coding"):
-                    _base = _base.rstrip("/") + "/v1"
                 _url = (_base.rstrip("/") + "/models") if _base else _default_url
                 _headers = {
                     "Authorization": f"Bearer {_key}",
                     "User-Agent": _HERMES_USER_AGENT,
                 }
-                if base_url_host_matches(_base, "api.kimi.com"):
-                    _headers["User-Agent"] = "claude-code/0.1.0"
                 _resp = httpx.get(
                     _url,
                     headers=_headers,
@@ -1151,32 +1031,6 @@ def run_doctor(args):
                     print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'(HTTP {_resp.status_code})', Colors.DIM)}           ")
             except Exception as _e:
                 print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_e})', Colors.DIM)}           ")
-
-    # -- AWS Bedrock --
-    # Bedrock uses the AWS SDK credential chain, not API keys.
-    try:
-        from agent.bedrock_adapter import has_aws_credentials, resolve_aws_auth_env_var, resolve_bedrock_region
-        if has_aws_credentials():
-            _auth_var = resolve_aws_auth_env_var()
-            _region = resolve_bedrock_region()
-            _label = "AWS Bedrock".ljust(20)
-            print(f"  Checking AWS Bedrock...", end="", flush=True)
-            try:
-                import boto3
-                _br_client = boto3.client("bedrock", region_name=_region)
-                _br_resp = _br_client.list_foundation_models()
-                _model_count = len(_br_resp.get("modelSummaries", []))
-                print(f"\r  {color('✓', Colors.GREEN)} {_label} {color(f'({_auth_var}, {_region}, {_model_count} models)', Colors.DIM)}           ")
-            except ImportError:
-                print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'(boto3 not installed — {sys.executable} -m pip install boto3)', Colors.DIM)}           ")
-                issues.append(f"Install boto3 for Bedrock: {sys.executable} -m pip install boto3")
-            except Exception as _e:
-                _err_name = type(_e).__name__
-                print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_err_name}: {_e})', Colors.DIM)}           ")
-                issues.append(f"AWS Bedrock: {_err_name} — check IAM permissions for bedrock:ListFoundationModels")
-    except ImportError:
-        pass  # bedrock_adapter not available — skip silently
-
     # =========================================================================
     # Check: Submodules
     # =========================================================================

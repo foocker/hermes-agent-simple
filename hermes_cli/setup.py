@@ -21,8 +21,6 @@ import copy
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from hermes_cli.nous_subscription import get_nous_subscription_features
-from tools.tool_backend_helpers import managed_nous_tools_enabled
 from utils import base_url_hostname
 from hermes_constants import get_optional_skills_dir
 
@@ -71,45 +69,9 @@ def _supports_same_provider_pool_setup(provider: str) -> bool:
 # Default model lists per provider — used as fallback when the live
 # /models endpoint can't be reached.
 _DEFAULT_PROVIDER_MODELS = {
-    "copilot-acp": [
-        "copilot-acp",
-    ],
-    "copilot": [
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5-mini",
-        "gpt-5.3-codex",
-        "gpt-5.2-codex",
-        "gpt-4.1",
-        "gpt-4o",
-        "gpt-4o-mini",
-        "claude-opus-4.6",
-        "claude-sonnet-4.6",
-        "claude-sonnet-4.5",
-        "claude-haiku-4.5",
-        "gemini-2.5-pro",
-        "grok-code-fast-1",
-    ],
-    "gemini": [
-        "gemini-3.1-pro-preview", "gemini-3-pro-preview",
-        "gemini-3-flash-preview", "gemini-3.1-flash-lite-preview",
-    ],
-    "zai": ["glm-5.1", "glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
-    "kimi-coding": ["kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
-    "kimi-coding-cn": ["kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
-    "stepfun": ["step-3.5-flash", "step-3.5-flash-2603"],
-    "arcee": ["trinity-large-thinking", "trinity-large-preview", "trinity-mini"],
-    "minimax": ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"],
-    "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1", "MiniMax-M2"],
-    "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
-    "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
-    "opencode-zen": ["gpt-5.4", "gpt-5.3-codex", "claude-sonnet-4-6", "gemini-3-flash", "glm-5", "kimi-k2.5", "minimax-m2.7"],
-    "opencode-go": ["kimi-k2.6", "kimi-k2.5", "glm-5.1", "glm-5", "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "minimax-m2.7", "minimax-m2.5", "qwen3.6-plus", "qwen3.5-plus"],
-    "huggingface": [
-        "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B-Thinking-2507",
-        "Qwen/Qwen3-Coder-480B-A35B-Instruct", "deepseek-ai/DeepSeek-R1-0528",
-        "deepseek-ai/DeepSeek-V3.2", "moonshotai/Kimi-K2.5",
-    ],
+    "openai": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
+    "openrouter": ["openai/gpt-5.5", "openai/gpt-5.4", "openai/gpt-5.4-mini"],
+    "ai-gateway": ["openai/gpt-5.4", "openai/gpt-5.4-mini", "openai/gpt-5.3-codex"],
 }
 
 
@@ -352,8 +314,6 @@ def _print_setup_summary(config: dict, hermes_home):
     print_header("Tool Availability Summary")
 
     tool_status = []
-    subscription_features = get_nous_subscription_features(config)
-
     # Vision — use the same runtime resolver as the actual vision tools
     try:
         from agent.auxiliary_client import get_available_vision_backends
@@ -367,98 +327,64 @@ def _print_setup_summary(config: dict, hermes_home):
     else:
         tool_status.append(("Vision (image analysis)", False, "run 'hermes setup' to configure"))
 
-    # Mixture of Agents — requires OpenRouter specifically (calls multiple models)
-    if get_env_value("OPENROUTER_API_KEY"):
+    # Mixture of Agents — uses the configured OpenAI-compatible key.
+    if get_env_value("OPENAI_API_KEY"):
         tool_status.append(("Mixture of Agents", True, None))
     else:
-        tool_status.append(("Mixture of Agents", False, "OPENROUTER_API_KEY"))
+        tool_status.append(("Mixture of Agents", False, "OPENAI_API_KEY"))
 
     # Web tools (Exa, Parallel, Firecrawl, or Tavily)
-    if subscription_features.web.managed_by_nous:
-        tool_status.append(("Web Search & Extract (Nous subscription)", True, None))
-    elif subscription_features.web.available:
-        label = "Web Search & Extract"
-        if subscription_features.web.current_provider:
-            label = f"Web Search & Extract ({subscription_features.web.current_provider})"
-        tool_status.append((label, True, None))
+    if (
+        get_env_value("EXA_API_KEY")
+        or get_env_value("PARALLEL_API_KEY")
+        or get_env_value("FIRECRAWL_API_KEY")
+        or get_env_value("FIRECRAWL_API_URL")
+        or get_env_value("TAVILY_API_KEY")
+    ):
+        tool_status.append(("Web Search & Extract", True, None))
     else:
         tool_status.append(("Web Search & Extract", False, "EXA_API_KEY, PARALLEL_API_KEY, FIRECRAWL_API_KEY/FIRECRAWL_API_URL, or TAVILY_API_KEY"))
 
     # Browser tools (local Chromium, Camofox, Browserbase, Browser Use, or Firecrawl)
-    browser_provider = subscription_features.browser.current_provider
-    if subscription_features.browser.managed_by_nous:
-        tool_status.append(("Browser Automation (Nous Browser Use)", True, None))
-    elif subscription_features.browser.available:
-        label = "Browser Automation"
-        if browser_provider:
-            label = f"Browser Automation ({browser_provider})"
-        tool_status.append((label, True, None))
+    if (
+        get_env_value("CAMOFOX_URL")
+        or get_env_value("BROWSER_USE_API_KEY")
+        or (get_env_value("BROWSERBASE_API_KEY") and get_env_value("BROWSERBASE_PROJECT_ID"))
+        or shutil.which("agent-browser")
+    ):
+        tool_status.append(("Browser Automation", True, None))
     else:
         missing_browser_hint = "npm install -g agent-browser, set CAMOFOX_URL, or configure Browser Use or Browserbase"
-        if browser_provider == "Browserbase":
-            missing_browser_hint = (
-                "npm install -g agent-browser and set "
-                "BROWSERBASE_API_KEY/BROWSERBASE_PROJECT_ID"
-            )
-        elif browser_provider == "Browser Use":
-            missing_browser_hint = (
-                "npm install -g agent-browser and set BROWSER_USE_API_KEY"
-            )
-        elif browser_provider == "Camofox":
-            missing_browser_hint = "CAMOFOX_URL"
-        elif browser_provider == "Local browser":
-            missing_browser_hint = "npm install -g agent-browser"
         tool_status.append(
             ("Browser Automation", False, missing_browser_hint)
         )
 
-    # Image generation — FAL (direct or via Nous), or any plugin-registered
-    # provider (OpenAI, etc.)
-    if subscription_features.image_gen.managed_by_nous:
-        tool_status.append(("Image Generation (Nous subscription)", True, None))
-    elif subscription_features.image_gen.available:
-        tool_status.append(("Image Generation", True, None))
-    else:
-        # Fall back to probing plugin-registered providers so OpenAI-only
-        # setups don't show as "missing FAL_KEY".
-        _img_backend = None
-        try:
-            from agent.image_gen_registry import list_providers
-            from hermes_cli.plugins import _ensure_plugins_discovered
+    _img_backend = None
+    try:
+        from agent.image_gen_registry import list_providers
+        from hermes_cli.plugins import _ensure_plugins_discovered
 
-            _ensure_plugins_discovered()
-            for _p in list_providers():
-                if _p.name == "fal":
-                    continue
-                try:
-                    if _p.is_available():
-                        _img_backend = _p.display_name
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        if _img_backend:
-            tool_status.append((f"Image Generation ({_img_backend})", True, None))
-        else:
-            tool_status.append(("Image Generation", False, "FAL_KEY or OPENAI_API_KEY"))
+        _ensure_plugins_discovered()
+        for _p in list_providers():
+            try:
+                if _p.is_available():
+                    _img_backend = _p.display_name
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if _img_backend:
+        tool_status.append((f"Image Generation ({_img_backend})", True, None))
+    else:
+        tool_status.append(("Image Generation", False, "FAL_KEY or OPENAI_API_KEY"))
 
     # TTS — show configured provider
     tts_provider = cfg_get(config, "tts", "provider", default="edge")
-    if subscription_features.tts.managed_by_nous:
-        tool_status.append(("Text-to-Speech (OpenAI via Nous subscription)", True, None))
-    elif tts_provider == "elevenlabs" and get_env_value("ELEVENLABS_API_KEY"):
-        tool_status.append(("Text-to-Speech (ElevenLabs)", True, None))
-    elif tts_provider == "openai" and (
+    if tts_provider == "openai" and (
         get_env_value("VOICE_TOOLS_OPENAI_KEY") or get_env_value("OPENAI_API_KEY")
     ):
         tool_status.append(("Text-to-Speech (OpenAI)", True, None))
-    elif tts_provider == "minimax" and get_env_value("MINIMAX_API_KEY"):
-        tool_status.append(("Text-to-Speech (MiniMax)", True, None))
-    elif tts_provider == "mistral" and get_env_value("MISTRAL_API_KEY"):
-        tool_status.append(("Text-to-Speech (Mistral Voxtral)", True, None))
-    elif tts_provider == "gemini" and (get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY")):
-        tool_status.append(("Text-to-Speech (Google Gemini)", True, None))
     elif tts_provider == "neutts":
         try:
             neutts_ok = importlib.util.find_spec("neutts") is not None
@@ -481,15 +407,11 @@ def _print_setup_summary(config: dict, hermes_home):
     else:
         tool_status.append(("Text-to-Speech (Edge TTS)", True, None))
 
-    if subscription_features.modal.managed_by_nous:
-        tool_status.append(("Modal Execution (Nous subscription)", True, None))
-    elif cfg_get(config, "terminal", "backend") == "modal":
-        if subscription_features.modal.direct_override:
-            tool_status.append(("Modal Execution (direct Modal)", True, None))
+    if cfg_get(config, "terminal", "backend") == "modal":
+        if get_env_value("MODAL_TOKEN_ID") and get_env_value("MODAL_TOKEN_SECRET"):
+            tool_status.append(("Modal Execution", True, None))
         else:
-            tool_status.append(("Modal Execution", False, "run 'hermes setup terminal'"))
-    elif managed_nous_tools_enabled() and subscription_features.nous_auth_present:
-        tool_status.append(("Modal Execution (optional via Nous subscription)", True, None))
+            tool_status.append(("Modal Execution", False, "MODAL_TOKEN_ID/MODAL_TOKEN_SECRET"))
 
     # Tinker + WandB (RL training)
     if get_env_value("TINKER_API_KEY") and get_env_value("WANDB_API_KEY"):
@@ -502,15 +424,6 @@ def _print_setup_summary(config: dict, hermes_home):
     # Home Assistant
     if get_env_value("HASS_TOKEN"):
         tool_status.append(("Smart Home (Home Assistant)", True, None))
-
-    # Spotify (OAuth via hermes auth spotify — check auth.json, not env vars)
-    try:
-        from hermes_cli.auth import get_provider_auth_state
-        _spotify_state = get_provider_auth_state("spotify") or {}
-        if _spotify_state.get("access_token") or _spotify_state.get("refresh_token"):
-            tool_status.append(("Spotify (PKCE OAuth)", True, None))
-    except Exception:
-        pass
 
     # Skills Hub
     if get_env_value("GITHUB_TOKEN"):
@@ -905,17 +818,10 @@ def setup_model_provider(config: dict, *, quick: bool = False):
 
     if _vision_needs_setup:
         _prov_names = {
-            "nous-api": "Nous Portal API key",
-            "copilot": "GitHub Copilot",
-            "copilot-acp": "GitHub Copilot ACP",
-            "zai": "Z.AI / GLM",
-            "kimi-coding": "Kimi / Moonshot",
-            "kimi-coding-cn": "Kimi / Moonshot (China)",
-            "stepfun": "StepFun Step Plan",
-            "minimax": "MiniMax",
-            "minimax-cn": "MiniMax CN",
-            "anthropic": "Anthropic",
-            "ai-gateway": "Vercel AI Gateway",
+            "openai": "OpenAI GPT",
+            "openrouter": "OpenRouter GPT",
+            "ai-gateway": "Vercel AI Gateway GPT",
+            "openai-codex": "OpenAI Codex",
             "custom": "your custom endpoint",
         }
         _prov_display = _prov_names.get(selected_provider, selected_provider or "your provider")
@@ -928,17 +834,17 @@ def setup_model_provider(config: dict, *, quick: bool = False):
         print()
 
         _vision_choices = [
-            "OpenRouter — uses Gemini (free tier at openrouter.ai/keys)",
+            "OpenAI GPT vision — OPENAI_API_KEY",
             "OpenAI-compatible endpoint — base URL, API key, and vision model",
             "Skip for now",
         ]
         _vision_idx = prompt_choice("Configure vision:", _vision_choices, 2)
 
-        if _vision_idx == 0:  # OpenRouter
-            _or_key = prompt("  OpenRouter API key", password=True).strip()
-            if _or_key:
-                save_env_value("OPENROUTER_API_KEY", _or_key)
-                print_success("OpenRouter key saved — vision will use Gemini")
+        if _vision_idx == 0:  # OpenAI
+            _oai_key = prompt("  OpenAI API key", password=True).strip()
+            if _oai_key:
+                save_env_value("OPENAI_API_KEY", _oai_key)
+                print_success("OpenAI key saved — vision will use GPT vision")
             else:
                 print_info("Skipped — vision won't be available")
         elif _vision_idx == 1:  # OpenAI-compatible endpoint
@@ -975,10 +881,9 @@ def setup_model_provider(config: dict, *, quick: bool = False):
             print_info("Skipped — add later with 'hermes setup' or configure AUXILIARY_VISION_* settings")
 
 
-    # Tool Gateway prompt is already shown by _model_flow_nous() above.
     save_config(config)
 
-    if not quick and selected_provider != "nous":
+    if not quick:
         _setup_tts_provider(config)
 
 
@@ -1071,16 +976,10 @@ def _setup_tts_provider(config: dict):
     """Interactive TTS provider selection with install flow for NeuTTS."""
     tts_config = config.get("tts", {})
     current_provider = tts_config.get("provider", "edge")
-    subscription_features = get_nous_subscription_features(config)
 
     provider_labels = {
         "edge": "Edge TTS",
-        "elevenlabs": "ElevenLabs",
         "openai": "OpenAI TTS",
-        "xai": "xAI TTS",
-        "minimax": "MiniMax TTS",
-        "mistral": "Mistral Voxtral TTS",
-        "gemini": "Google Gemini TTS",
         "neutts": "NeuTTS",
         "kittentts": "KittenTTS",
     }
@@ -1091,25 +990,13 @@ def _setup_tts_provider(config: dict):
     print_info(f"Current: {current_label}")
     print()
 
-    choices = []
-    providers = []
-    if managed_nous_tools_enabled() and subscription_features.nous_auth_present:
-        choices.append("Nous Subscription (managed OpenAI TTS, billed to your subscription)")
-        providers.append("nous-openai")
-    choices.extend(
-        [
-            "Edge TTS (free, cloud-based, no setup needed)",
-            "ElevenLabs (premium quality, needs API key)",
-            "OpenAI TTS (good quality, needs API key)",
-            "xAI TTS (Grok voices, needs API key)",
-            "MiniMax TTS (high quality with voice cloning, needs API key)",
-            "Mistral Voxtral TTS (multilingual, native Opus, needs API key)",
-            "Google Gemini TTS (30 prebuilt voices, prompt-controllable, needs API key)",
-            "NeuTTS (local on-device, free, ~300MB model download)",
-            "KittenTTS (local on-device, free, lightweight ~25-80MB ONNX)",
-        ]
-    )
-    providers.extend(["edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts"])
+    choices = [
+        "Edge TTS (free, cloud-based, no setup needed)",
+        "OpenAI TTS (good quality, needs API key)",
+        "NeuTTS (local on-device, free, ~300MB model download)",
+        "KittenTTS (local on-device, free, lightweight ~25-80MB ONNX)",
+    ]
+    providers = ["edge", "openai", "neutts", "kittentts"]
     choices.append(f"Keep current ({current_label})")
     keep_current_idx = len(choices) - 1
     idx = prompt_choice("Select TTS provider:", choices, keep_current_idx)
@@ -1118,14 +1005,6 @@ def _setup_tts_provider(config: dict):
         return
 
     selected = providers[idx]
-    selected_via_nous = selected == "nous-openai"
-    if selected == "nous-openai":
-        selected = "openai"
-        print_info("OpenAI TTS will use the managed Nous gateway and bill to your subscription.")
-        if get_env_value("VOICE_TOOLS_OPENAI_KEY") or get_env_value("OPENAI_API_KEY"):
-            print_warning(
-                "Direct OpenAI credentials are still configured and may take precedence until removed from ~/.hermes/.env."
-            )
 
     if selected == "neutts":
         # Check if already installed
@@ -1150,19 +1029,7 @@ def _setup_tts_provider(config: dict):
                 print_info("Skipping install. Set tts.provider to 'neutts' after installing manually.")
                 selected = "edge"
 
-    elif selected == "elevenlabs":
-        existing = get_env_value("ELEVENLABS_API_KEY")
-        if not existing:
-            print()
-            api_key = prompt("ElevenLabs API key", password=True)
-            if api_key:
-                save_env_value("ELEVENLABS_API_KEY", api_key)
-                print_success("ElevenLabs API key saved")
-            else:
-                print_warning("No API key provided. Falling back to Edge TTS.")
-                selected = "edge"
-
-    elif selected == "openai" and not selected_via_nous:
+    elif selected == "openai":
         existing = get_env_value("VOICE_TOOLS_OPENAI_KEY") or get_env_value("OPENAI_API_KEY")
         if not existing:
             print()
@@ -1170,60 +1037,6 @@ def _setup_tts_provider(config: dict):
             if api_key:
                 save_env_value("VOICE_TOOLS_OPENAI_KEY", api_key)
                 print_success("OpenAI TTS API key saved")
-            else:
-                print_warning("No API key provided. Falling back to Edge TTS.")
-                selected = "edge"
-
-    elif selected == "xai":
-        existing = get_env_value("XAI_API_KEY")
-        if not existing:
-            print()
-            api_key = prompt("xAI API key for TTS", password=True)
-            if api_key:
-                save_env_value("XAI_API_KEY", api_key)
-                print_success("xAI TTS API key saved")
-            else:
-                from hermes_constants import display_hermes_home as _dhh
-                print_warning(
-                    "No xAI API key provided for TTS. Configure XAI_API_KEY via "
-                    f"hermes setup model or {_dhh()}/.env to use xAI TTS. "
-                    "Falling back to Edge TTS."
-                )
-                selected = "edge"
-
-    elif selected == "minimax":
-        existing = get_env_value("MINIMAX_API_KEY")
-        if not existing:
-            print()
-            api_key = prompt("MiniMax API key for TTS", password=True)
-            if api_key:
-                save_env_value("MINIMAX_API_KEY", api_key)
-                print_success("MiniMax TTS API key saved")
-            else:
-                print_warning("No API key provided. Falling back to Edge TTS.")
-                selected = "edge"
-
-    elif selected == "mistral":
-        existing = get_env_value("MISTRAL_API_KEY")
-        if not existing:
-            print()
-            api_key = prompt("Mistral API key for TTS", password=True)
-            if api_key:
-                save_env_value("MISTRAL_API_KEY", api_key)
-                print_success("Mistral TTS API key saved")
-            else:
-                print_warning("No API key provided. Falling back to Edge TTS.")
-                selected = "edge"
-
-    elif selected == "gemini":
-        existing = get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY")
-        if not existing:
-            print()
-            print_info("Get a free API key at https://aistudio.google.com/app/apikey")
-            api_key = prompt("Gemini API key for TTS", password=True)
-            if api_key:
-                save_env_value("GEMINI_API_KEY", api_key)
-                print_success("Gemini TTS API key saved")
             else:
                 print_warning("No API key provided. Falling back to Edge TTS.")
                 selected = "edge"
@@ -1389,99 +1202,62 @@ def setup_terminal_backend(config: dict):
     elif selected_backend == "modal":
         print_success("Terminal backend: Modal")
         print_info("Serverless cloud sandboxes. Each session gets its own container.")
-        from tools.managed_tool_gateway import is_managed_tool_gateway_ready
-        from tools.tool_backend_helpers import normalize_modal_mode
+        config["terminal"]["modal_mode"] = "direct"
+        print_info("Requires a Modal account: https://modal.com")
 
-        managed_modal_available = bool(
-            managed_nous_tools_enabled()
-            and
-            get_nous_subscription_features(config).nous_auth_present
-            and is_managed_tool_gateway_ready("modal")
-        )
-        modal_mode = normalize_modal_mode(cfg_get(config, "terminal", "modal_mode"))
-        use_managed_modal = False
-        if managed_modal_available:
-            modal_choices = [
-                "Use my Nous subscription",
-                "Use my own Modal account",
-            ]
-            if modal_mode == "managed":
-                default_modal_idx = 0
-            elif modal_mode == "direct":
-                default_modal_idx = 1
-            else:
-                default_modal_idx = 1 if get_env_value("MODAL_TOKEN_ID") else 0
-            modal_mode_idx = prompt_choice(
-                "Select how Modal execution should be billed:",
-                modal_choices,
-                default_modal_idx,
-            )
-            use_managed_modal = modal_mode_idx == 0
+        # Check if modal SDK is installed
+        try:
+            __import__("modal")
+        except ImportError:
+            print_info("Installing modal SDK...")
+            import subprocess
 
-        if use_managed_modal:
-            config["terminal"]["modal_mode"] = "managed"
-            print_info("Modal execution will use the managed Nous gateway and bill to your subscription.")
-            if get_env_value("MODAL_TOKEN_ID") or get_env_value("MODAL_TOKEN_SECRET"):
-                print_info(
-                    "Direct Modal credentials are still configured, but this backend is pinned to managed mode."
+            uv_bin = shutil.which("uv")
+            if uv_bin:
+                result = subprocess.run(
+                    [
+                        uv_bin,
+                        "pip",
+                        "install",
+                        "--python",
+                        sys.executable,
+                        "modal",
+                    ],
+                    capture_output=True,
+                    text=True,
                 )
-        else:
-            config["terminal"]["modal_mode"] = "direct"
-            print_info("Requires a Modal account: https://modal.com")
-
-            # Check if modal SDK is installed
-            try:
-                __import__("modal")
-            except ImportError:
-                print_info("Installing modal SDK...")
-                import subprocess
-
-                uv_bin = shutil.which("uv")
-                if uv_bin:
-                    result = subprocess.run(
-                        [
-                            uv_bin,
-                            "pip",
-                            "install",
-                            "--python",
-                            sys.executable,
-                            "modal",
-                        ],
-                        capture_output=True,
-                        text=True,
-                    )
-                else:
-                    result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install", "modal"],
-                        capture_output=True,
-                        text=True,
-                    )
-                if result.returncode == 0:
-                    print_success("modal SDK installed")
-                else:
-                    print_warning("Install failed — run manually: pip install modal")
-
-            # Modal token
-            print()
-            print_info("Modal authentication:")
-            print_info("  Get your token at: https://modal.com/settings")
-            existing_token = get_env_value("MODAL_TOKEN_ID")
-            if existing_token:
-                print_info("  Modal token: already configured")
-                if prompt_yes_no("  Update Modal credentials?", False):
-                    token_id = prompt("    Modal Token ID", password=True)
-                    token_secret = prompt("    Modal Token Secret", password=True)
-                    if token_id:
-                        save_env_value("MODAL_TOKEN_ID", token_id)
-                    if token_secret:
-                        save_env_value("MODAL_TOKEN_SECRET", token_secret)
             else:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "modal"],
+                    capture_output=True,
+                    text=True,
+                )
+            if result.returncode == 0:
+                print_success("modal SDK installed")
+            else:
+                print_warning("Install failed — run manually: pip install modal")
+
+        # Modal token
+        print()
+        print_info("Modal authentication:")
+        print_info("  Get your token at: https://modal.com/settings")
+        existing_token = get_env_value("MODAL_TOKEN_ID")
+        if existing_token:
+            print_info("  Modal token: already configured")
+            if prompt_yes_no("  Update Modal credentials?", False):
                 token_id = prompt("    Modal Token ID", password=True)
                 token_secret = prompt("    Modal Token Secret", password=True)
                 if token_id:
                     save_env_value("MODAL_TOKEN_ID", token_id)
                 if token_secret:
                     save_env_value("MODAL_TOKEN_SECRET", token_secret)
+        else:
+            token_id = prompt("    Modal Token ID", password=True)
+            token_secret = prompt("    Modal Token Secret", password=True)
+            if token_id:
+                save_env_value("MODAL_TOKEN_ID", token_id)
+            if token_secret:
+                save_env_value("MODAL_TOKEN_SECRET", token_secret)
 
         _prompt_container_resources(config)
 
@@ -2550,9 +2326,8 @@ def _model_section_has_credentials(config: dict) -> bool:
       * ``PROVIDER_REGISTRY`` in ``hermes_cli.auth`` — lists every supported
         provider along with its ``api_key_env_vars``.
       * ``active_provider`` in the auth store — covers OAuth device-code /
-        external-OAuth providers (Nous, Codex, Qwen, Gemini CLI, ...).
-      * The legacy OpenRouter aggregator env vars, which route generic
-        ``OPENAI_API_KEY`` / ``OPENROUTER_API_KEY`` values through OpenRouter.
+        external-OAuth providers (Codex).
+      * GPT API keys for OpenAI, OpenRouter, and Vercel AI Gateway.
     """
     try:
         from hermes_cli.auth import get_active_provider
@@ -2568,10 +2343,6 @@ def _model_section_has_credentials(config: dict) -> bool:
 
     def _has_key(pconfig) -> bool:
         for env_var in pconfig.api_key_env_vars:
-            # CLAUDE_CODE_OAUTH_TOKEN is set by Claude Code itself, not by
-            # the user — mirrors is_provider_explicitly_configured in auth.py.
-            if env_var == "CLAUDE_CODE_OAUTH_TOKEN":
-                continue
             if get_env_value(env_var):
                 return True
         return False
@@ -2585,21 +2356,11 @@ def _model_section_has_credentials(config: dict) -> bool:
         if provider_id in PROVIDER_REGISTRY:
             if _has_key(PROVIDER_REGISTRY[provider_id]):
                 return True
-        if provider_id == "openrouter":
-            for env_var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
-                if get_env_value(env_var):
-                    return True
-
-    # OpenRouter aggregator fallback (no provider declared in config).
-    for env_var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+    for env_var in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY"):
         if get_env_value(env_var):
             return True
 
     for pid, pconfig in PROVIDER_REGISTRY.items():
-        # Skip copilot in auto-detect: GH_TOKEN / GITHUB_TOKEN are
-        # commonly set for git tooling.  Mirrors resolve_provider in auth.py.
-        if pid == "copilot":
-            continue
         if _has_key(pconfig):
             return True
     return False
@@ -2653,8 +2414,6 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
 
     elif section_key == "tools":
         tools = []
-        if get_env_value("ELEVENLABS_API_KEY"):
-            tools.append("TTS/ElevenLabs")
         if get_env_value("BROWSERBASE_API_KEY"):
             tools.append("Browser")
         if get_env_value("FIRECRAWL_API_KEY"):

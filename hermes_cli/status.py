@@ -16,11 +16,7 @@ from hermes_cli.auth import AuthError, resolve_provider
 from hermes_cli.colors import Colors, color
 from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load_config
 from hermes_cli.models import provider_label
-from hermes_cli.nous_subscription import get_nous_subscription_features
 from hermes_cli.runtime_provider import resolve_requested_provider
-from hermes_cli.vercel_auth import describe_vercel_auth
-from hermes_constants import OPENROUTER_MODELS_URL
-from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 def check_mark(ok: bool) -> str:
     if ok:
@@ -78,9 +74,6 @@ def _effective_provider_label() -> str:
     except AuthError:
         effective = requested or "auto"
 
-    if effective == "openrouter" and get_env_value("OPENAI_BASE_URL"):
-        effective = "custom"
-
     return provider_label(effective)
 
 
@@ -123,13 +116,9 @@ def show_status(args):
     print(color("◆ API Keys", Colors.CYAN, Colors.BOLD))
 
     keys = {
-        "OpenRouter": "OPENROUTER_API_KEY",
         "OpenAI": "OPENAI_API_KEY",
-        "Z.AI/GLM": "GLM_API_KEY",
-        "Kimi": "KIMI_API_KEY",
-        "StepFun Step Plan": "STEPFUN_API_KEY",
-        "MiniMax": "MINIMAX_API_KEY",
-        "MiniMax-CN": "MINIMAX_CN_API_KEY",
+        "OpenRouter": "OPENROUTER_API_KEY",
+        "AI Gateway": "AI_GATEWAY_API_KEY",
         "Firecrawl": "FIRECRAWL_API_KEY",
         "Tavily": "TAVILY_API_KEY",
         "Browser Use": "BROWSER_USE_API_KEY",  # Optional — local browser works without this
@@ -137,7 +126,6 @@ def show_status(args):
         "FAL": "FAL_KEY",
         "Tinker": "TINKER_API_KEY",
         "WandB": "WANDB_API_KEY",
-        "ElevenLabs": "ELEVENLABS_API_KEY",
         "GitHub": "GITHUB_TOKEN",
     }
 
@@ -147,11 +135,6 @@ def show_status(args):
         display = redact_key(value) if not show_all else value
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
 
-    from hermes_cli.auth import get_anthropic_key
-    anthropic_value = get_anthropic_key()
-    anthropic_display = redact_key(anthropic_value) if not show_all else anthropic_value
-    print(f"  {'Anthropic':<12}  {check_mark(bool(anthropic_value))} {anthropic_display}")
-
     # =========================================================================
     # Auth Providers (OAuth)
     # =========================================================================
@@ -159,48 +142,15 @@ def show_status(args):
     print(color("◆ Auth Providers", Colors.CYAN, Colors.BOLD))
 
     try:
-        from hermes_cli.auth import (
-            get_nous_auth_status,
-            get_codex_auth_status,
-            get_qwen_auth_status,
-            get_minimax_oauth_auth_status,
-        )
-        nous_status = get_nous_auth_status()
+        from hermes_cli.auth import get_codex_auth_status
         codex_status = get_codex_auth_status()
-        qwen_status = get_qwen_auth_status()
-        minimax_status = get_minimax_oauth_auth_status()
     except Exception:
-        nous_status = {}
         codex_status = {}
-        qwen_status = {}
-        minimax_status = {}
-
-    nous_logged_in = bool(nous_status.get("logged_in"))
-    nous_error = nous_status.get("error")
-    nous_label = "logged in" if nous_logged_in else "not logged in (run: hermes auth add nous --type oauth)"
-    print(
-        f"  {'Nous Portal':<12}  {check_mark(nous_logged_in)} "
-        f"{nous_label}"
-    )
-    portal_url = nous_status.get("portal_base_url") or "(unknown)"
-    access_exp = _format_iso_timestamp(nous_status.get("access_expires_at"))
-    key_exp = _format_iso_timestamp(nous_status.get("agent_key_expires_at"))
-    refresh_label = "yes" if nous_status.get("has_refresh_token") else "no"
-    if nous_logged_in or portal_url != "(unknown)" or nous_error:
-        print(f"    Portal URL: {portal_url}")
-    if nous_logged_in or nous_status.get("access_expires_at"):
-        print(f"    Access exp: {access_exp}")
-    if nous_logged_in or nous_status.get("agent_key_expires_at"):
-        print(f"    Key exp:    {key_exp}")
-    if nous_logged_in or nous_status.get("has_refresh_token"):
-        print(f"    Refresh:    {refresh_label}")
-    if nous_error and not nous_logged_in:
-        print(f"    Error:      {nous_error}")
 
     codex_logged_in = bool(codex_status.get("logged_in"))
     print(
         f"  {'OpenAI Codex':<12}  {check_mark(codex_logged_in)} "
-        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes model)'}"
+        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes auth add openai-codex)'}"
     )
     codex_auth_file = codex_status.get("auth_store")
     if codex_auth_file:
@@ -210,112 +160,6 @@ def show_status(args):
         print(f"    Refreshed:  {codex_last_refresh}")
     if codex_status.get("error") and not codex_logged_in:
         print(f"    Error:      {codex_status.get('error')}")
-
-    qwen_logged_in = bool(qwen_status.get("logged_in"))
-    print(
-        f"  {'Qwen OAuth':<12}  {check_mark(qwen_logged_in)} "
-        f"{'logged in' if qwen_logged_in else 'not logged in (run: qwen auth qwen-oauth)'}"
-    )
-    qwen_auth_file = qwen_status.get("auth_file")
-    if qwen_auth_file:
-        print(f"    Auth file:  {qwen_auth_file}")
-    qwen_exp = qwen_status.get("expires_at_ms")
-    if qwen_exp:
-        from datetime import datetime, timezone
-        print(f"    Access exp: {datetime.fromtimestamp(int(qwen_exp) / 1000, tz=timezone.utc).isoformat()}")
-    if qwen_status.get("error") and not qwen_logged_in:
-        print(f"    Error:      {qwen_status.get('error')}")
-
-    minimax_logged_in = bool(minimax_status.get("logged_in"))
-    print(
-        f"  {'MiniMax OAuth':<12}  {check_mark(minimax_logged_in)} "
-        f"{'logged in' if minimax_logged_in else 'not logged in (run: hermes auth add minimax-oauth)'}"
-    )
-    minimax_region = minimax_status.get("region")
-    if minimax_logged_in and minimax_region:
-        print(f"    Region:     {minimax_region}")
-    minimax_exp = minimax_status.get("expires_at")
-    if minimax_exp:
-        print(f"    Access exp: {minimax_exp}")
-    if minimax_status.get("error") and not minimax_logged_in:
-        print(f"    Error:      {minimax_status.get('error')}")
-
-    # =========================================================================
-    # Nous Subscription Features
-    # =========================================================================
-    if managed_nous_tools_enabled():
-        features = get_nous_subscription_features(config)
-        print()
-        print(color("◆ Nous Tool Gateway", Colors.CYAN, Colors.BOLD))
-        if not features.nous_auth_present:
-            print("  Nous Portal   ✗ not logged in")
-        else:
-            print("  Nous Portal   ✓ managed tools available")
-        for feature in features.items():
-            if feature.managed_by_nous:
-                state = "active via Nous subscription"
-            elif feature.active:
-                current = feature.current_provider or "configured provider"
-                state = f"active via {current}"
-            elif feature.included_by_default and features.nous_auth_present:
-                state = "included by subscription, not currently selected"
-            elif feature.key == "modal" and features.nous_auth_present:
-                state = "available via subscription (optional)"
-            else:
-                state = "not configured"
-            print(f"  {feature.label:<15} {check_mark(feature.available or feature.active or feature.managed_by_nous)} {state}")
-    elif nous_logged_in:
-        # Logged into Nous but on the free tier — show upgrade nudge
-        print()
-        print(color("◆ Nous Tool Gateway", Colors.CYAN, Colors.BOLD))
-        print("  Your free-tier Nous account does not include Tool Gateway access.")
-        print("  Upgrade your subscription to unlock managed web, image, TTS, and browser tools.")
-        try:
-            portal_url = nous_status.get("portal_base_url", "").rstrip("/")
-            if portal_url:
-                print(f"  Upgrade: {portal_url}")
-        except Exception:
-            pass
-
-    # =========================================================================
-    # API-Key Providers
-    # =========================================================================
-    print()
-    print(color("◆ API-Key Providers", Colors.CYAN, Colors.BOLD))
-
-    apikey_providers = {
-        "Z.AI / GLM":       ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
-        "Kimi / Moonshot":  ("KIMI_API_KEY",),
-        "StepFun Step Plan": ("STEPFUN_API_KEY",),
-        "MiniMax":          ("MINIMAX_API_KEY",),
-        "MiniMax (China)":  ("MINIMAX_CN_API_KEY",),
-    }
-    for pname, env_vars in apikey_providers.items():
-        key_val = ""
-        for ev in env_vars:
-            key_val = get_env_value(ev) or ""
-            if key_val:
-                break
-        configured = bool(key_val)
-        label = "configured" if configured else "not configured (run: hermes model)"
-        print(f"  {pname:<16} {check_mark(configured)} {label}")
-
-    # LM Studio reachability — only probe when it's the active provider so
-    # users with foreign configs don't see noise. Auth rejection vs. silent
-    # empty list is the most common LM Studio support case.
-    if _effective_provider_label() == "LM Studio":
-        from hermes_cli.models import probe_lmstudio_models
-        model_cfg = config.get("model")
-        base = (model_cfg.get("base_url") if isinstance(model_cfg, dict) else None) or get_env_value("LM_BASE_URL") or "http://127.0.0.1:1234/v1"
-        try:
-            models = probe_lmstudio_models(api_key=get_env_value("LM_API_KEY") or "", base_url=base, timeout=1.5)
-            if models is None:
-                ok, msg = False, f"unreachable at {base}"
-            else:
-                ok, msg = True, f"reachable ({len(models)} model(s)) at {base}"
-        except AuthError:
-            ok, msg = False, "auth rejected — set LM_API_KEY"
-        print(f"  {'LM Studio':<16} {check_mark(ok)} {msg}")
 
     # =========================================================================
     # Terminal Configuration
@@ -494,20 +338,20 @@ def show_status(args):
         print()
         print(color("◆ Deep Checks", Colors.CYAN, Colors.BOLD))
         
-        # Check OpenRouter connectivity
-        openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
-        if openrouter_key:
+        # Check OpenAI connectivity
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if openai_key:
             try:
                 import httpx
                 response = httpx.get(
-                    OPENROUTER_MODELS_URL,
-                    headers={"Authorization": f"Bearer {openrouter_key}"},
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
                     timeout=10
                 )
                 ok = response.status_code == 200
-                print(f"  OpenRouter:   {check_mark(ok)} {'reachable' if ok else f'error ({response.status_code})'}")
+                print(f"  OpenAI:       {check_mark(ok)} {'reachable' if ok else f'error ({response.status_code})'}")
             except Exception as e:
-                print(f"  OpenRouter:   {check_mark(False)} error: {e}")
+                print(f"  OpenAI:       {check_mark(False)} error: {e}")
         
         # Check gateway port
         try:

@@ -13,7 +13,6 @@ license = { text = "MIT" }
 dependencies = [
   # Core — pinned to known-good ranges to limit supply chain attack surface
   "openai>=2.21.0,<3",
-  "anthropic>=0.39.0,<1",
   "python-dotenv>=1.2.1,<2",
   "fire>=0.7.1,<1",
   "httpx[socks]>=0.28.1,<1",
@@ -49,11 +48,6 @@ pty = [
 mcp = ["mcp>=1.2.0,<2"]
 feishu = ["lark-oapi>=1.5.3,<2", "qrcode>=7.0,<8"]
 wecom = ["aiohttp>=3.13.3,<4", "httpx[socks]>=0.28.1,<1"]
-google = [
-  "google-api-python-client>=2.100,<3",
-  "google-auth-oauthlib>=1.0,<2",
-  "google-auth-httplib2>=0.2,<1",
-]
 all = [
   "hermes-agent-simple[cli]",
   "hermes-agent-simple[dev]",
@@ -61,7 +55,6 @@ all = [
   "hermes-agent-simple[mcp]",
   "hermes-agent-simple[feishu]",
   "hermes-agent-simple[wecom]",
-  "hermes-agent-simple[google]",
 ]
 
 [project.scripts]

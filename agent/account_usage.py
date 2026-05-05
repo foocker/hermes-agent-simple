@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 import httpx
 
-from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
 from hermes_cli.auth import _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -172,66 +171,6 @@ def _fetch_codex_account_usage() -> Optional[AccountUsageSnapshot]:
     )
 
 
-def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
-    token = (resolve_anthropic_token() or "").strip()
-    if not token:
-        return None
-    if not _is_oauth_token(token):
-        return AccountUsageSnapshot(
-            provider="anthropic",
-            source="oauth_usage_api",
-            fetched_at=_utc_now(),
-            unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.",
-        )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/2.1.0",
-    }
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
-        response.raise_for_status()
-    payload = response.json() or {}
-    windows: list[AccountUsageWindow] = []
-    mapping = (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
-    )
-    for key, label in mapping:
-        window = payload.get(key) or {}
-        util = window.get("utilization")
-        if util is None:
-            continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
-        windows.append(
-            AccountUsageWindow(
-                label=label,
-                used_percent=used,
-                reset_at=_parse_dt(window.get("resets_at")),
-            )
-        )
-    details: list[str] = []
-    extra = payload.get("extra_usage") or {}
-    if extra.get("is_enabled"):
-        used_credits = extra.get("used_credits")
-        monthly_limit = extra.get("monthly_limit")
-        currency = extra.get("currency") or "USD"
-        if isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
-            details.append(
-                f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}"
-            )
-    return AccountUsageSnapshot(
-        provider="anthropic",
-        source="oauth_usage_api",
-        fetched_at=_utc_now(),
-        windows=tuple(windows),
-        details=tuple(details),
-    )
-
 
 def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:
     runtime = resolve_runtime_provider(
@@ -317,8 +256,6 @@ def fetch_account_usage(
     try:
         if normalized == "openai-codex":
             return _fetch_codex_account_usage()
-        if normalized == "anthropic":
-            return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
     except Exception:

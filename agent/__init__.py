@@ -4,3 +4,7 @@ These modules contain pure utility functions and self-contained classes
 that were previously embedded in the 3,600-line run_agent.py. Extracting
 them makes run_agent.py focused on the AIAgent orchestrator class.
 """
+
+from pathlib import Path
+
+__path__ = [str(Path(__file__).resolve().parent)]

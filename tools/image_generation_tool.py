@@ -24,20 +24,13 @@ import json
 import logging
 import os
 import datetime
-import threading
 import uuid
-from typing import Any, Dict, Optional, Union
-from urllib.parse import urlencode
+from typing import Any, Dict, Optional
 
 import fal_client
 
 from tools.debug_helpers import DebugSession
-from tools.managed_tool_gateway import resolve_managed_tool_gateway
-from tools.tool_backend_helpers import (
-    fal_key_is_configured,
-    managed_nous_tools_enabled,
-    prefers_gateway,
-)
+from tools.tool_backend_helpers import fal_key_is_configured
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +147,6 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "output_format": "png",
             "safety_tolerance": "5",
             # "1K" is the cheapest tier; 4K doubles the per-image cost.
-            # Users on Nous Subscription should stay at 1K for predictable billing.
             "resolution": "1K",
         },
         "supports": {
@@ -205,9 +197,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "portrait": "portrait_4_3",       # 768x1024
         },
         "defaults": {
-            # Same quality pinning as gpt-image-1.5: medium keeps Nous
-            # Portal billing predictable. "high" is 3-4x the per-image
-            # cost at the same size; "low" is too rough for production use.
+            # Same quality pinning as gpt-image-1.5: medium keeps image
+            # generation costs predictable. "high" is 3-4x the per-image cost
+            # at the same size; "low" is too rough for production use.
             "quality": "medium",
             "num_images": 1,
             "output_format": "png",
@@ -311,175 +303,12 @@ UPSCALER_NUM_INFERENCE_STEPS = 18
 
 
 _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
-_managed_fal_client = None
-_managed_fal_client_config = None
-_managed_fal_client_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------------
-# Managed FAL gateway (Nous Subscription)
-# ---------------------------------------------------------------------------
-def _resolve_managed_fal_gateway():
-    """Return managed fal-queue gateway config when the user prefers the gateway
-    or direct FAL credentials are absent."""
-    if fal_key_is_configured() and not prefers_gateway("image_gen"):
-        return None
-    return resolve_managed_tool_gateway("fal-queue")
-
-
-def _normalize_fal_queue_url_format(queue_run_origin: str) -> str:
-    normalized_origin = str(queue_run_origin or "").strip().rstrip("/")
-    if not normalized_origin:
-        raise ValueError("Managed FAL queue origin is required")
-    return f"{normalized_origin}/"
-
-
-class _ManagedFalSyncClient:
-    """Small per-instance wrapper around fal_client.SyncClient for managed queue hosts."""
-
-    def __init__(self, *, key: str, queue_run_origin: str):
-        sync_client_class = getattr(fal_client, "SyncClient", None)
-        if sync_client_class is None:
-            raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
-
-        client_module = getattr(fal_client, "client", None)
-        if client_module is None:
-            raise RuntimeError("fal_client.client is required for managed FAL gateway mode")
-
-        self._queue_url_format = _normalize_fal_queue_url_format(queue_run_origin)
-        self._sync_client = sync_client_class(key=key)
-        self._http_client = getattr(self._sync_client, "_client", None)
-        self._maybe_retry_request = getattr(client_module, "_maybe_retry_request", None)
-        self._raise_for_status = getattr(client_module, "_raise_for_status", None)
-        self._request_handle_class = getattr(client_module, "SyncRequestHandle", None)
-        self._add_hint_header = getattr(client_module, "add_hint_header", None)
-        self._add_priority_header = getattr(client_module, "add_priority_header", None)
-        self._add_timeout_header = getattr(client_module, "add_timeout_header", None)
-
-        if self._http_client is None:
-            raise RuntimeError("fal_client.SyncClient._client is required for managed FAL gateway mode")
-        if self._maybe_retry_request is None or self._raise_for_status is None:
-            raise RuntimeError("fal_client.client request helpers are required for managed FAL gateway mode")
-        if self._request_handle_class is None:
-            raise RuntimeError("fal_client.client.SyncRequestHandle is required for managed FAL gateway mode")
-
-    def submit(
-        self,
-        application: str,
-        arguments: Dict[str, Any],
-        *,
-        path: str = "",
-        hint: Optional[str] = None,
-        webhook_url: Optional[str] = None,
-        priority: Any = None,
-        headers: Optional[Dict[str, str]] = None,
-        start_timeout: Optional[Union[int, float]] = None,
-    ):
-        url = self._queue_url_format + application
-        if path:
-            url += "/" + path.lstrip("/")
-        if webhook_url is not None:
-            url += "?" + urlencode({"fal_webhook": webhook_url})
-
-        request_headers = dict(headers or {})
-        if hint is not None and self._add_hint_header is not None:
-            self._add_hint_header(hint, request_headers)
-        if priority is not None:
-            if self._add_priority_header is None:
-                raise RuntimeError("fal_client.client.add_priority_header is required for priority requests")
-            self._add_priority_header(priority, request_headers)
-        if start_timeout is not None:
-            if self._add_timeout_header is None:
-                raise RuntimeError("fal_client.client.add_timeout_header is required for timeout requests")
-            self._add_timeout_header(start_timeout, request_headers)
-
-        response = self._maybe_retry_request(
-            self._http_client,
-            "POST",
-            url,
-            json=arguments,
-            timeout=getattr(self._sync_client, "default_timeout", 120.0),
-            headers=request_headers,
-        )
-        self._raise_for_status(response)
-
-        data = response.json()
-        return self._request_handle_class(
-            request_id=data["request_id"],
-            response_url=data["response_url"],
-            status_url=data["status_url"],
-            cancel_url=data["cancel_url"],
-            client=self._http_client,
-        )
-
-
-def _get_managed_fal_client(managed_gateway):
-    """Reuse the managed FAL client so its internal httpx.Client is not leaked per call."""
-    global _managed_fal_client, _managed_fal_client_config
-
-    client_config = (
-        managed_gateway.gateway_origin.rstrip("/"),
-        managed_gateway.nous_user_token,
-    )
-    with _managed_fal_client_lock:
-        if _managed_fal_client is not None and _managed_fal_client_config == client_config:
-            return _managed_fal_client
-
-        _managed_fal_client = _ManagedFalSyncClient(
-            key=managed_gateway.nous_user_token,
-            queue_run_origin=managed_gateway.gateway_origin,
-        )
-        _managed_fal_client_config = client_config
-        return _managed_fal_client
 
 
 def _submit_fal_request(model: str, arguments: Dict[str, Any]):
-    """Submit a FAL request using direct credentials or the managed queue gateway."""
+    """Submit a FAL request using direct credentials."""
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
-    managed_gateway = _resolve_managed_fal_gateway()
-    if managed_gateway is None:
-        return fal_client.submit(model, arguments=arguments, headers=request_headers)
-
-    managed_client = _get_managed_fal_client(managed_gateway)
-    try:
-        return managed_client.submit(
-            model,
-            arguments=arguments,
-            headers=request_headers,
-        )
-    except Exception as exc:
-        # 4xx from the managed gateway typically means the portal doesn't
-        # currently proxy this model (allowlist miss, billing gate, etc.)
-        # — surface a clearer message with actionable remediation instead
-        # of a raw HTTP error from httpx.
-        status = _extract_http_status(exc)
-        if status is not None and 400 <= status < 500:
-            raise ValueError(
-                f"Nous Subscription gateway rejected model '{model}' "
-                f"(HTTP {status}). This model may not yet be enabled on "
-                f"the Nous Portal's FAL proxy. Either:\n"
-                f"  • Set FAL_KEY in your environment to use FAL.ai directly, or\n"
-                f"  • Pick a different model via `hermes tools` → Image Generation."
-            ) from exc
-        raise
-
-
-def _extract_http_status(exc: BaseException) -> Optional[int]:
-    """Return an HTTP status code from httpx/fal exceptions, else None.
-
-    Defensive across exception shapes — httpx.HTTPStatusError exposes
-    ``.response.status_code`` while fal_client wrappers may expose
-    ``.status_code`` directly.
-    """
-    response = getattr(exc, "response", None)
-    if response is not None:
-        status = getattr(response, "status_code", None)
-        if isinstance(status, int):
-            return status
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int):
-        return status
-    return None
+    return fal_client.submit(model, arguments=arguments, headers=request_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -659,11 +488,8 @@ def image_generate_tool(
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
 
-        if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
-            message = "FAL_KEY environment variable not set"
-            if managed_nous_tools_enabled():
-                message += " and managed FAL gateway is unavailable"
-            raise ValueError(message)
+        if not fal_key_is_configured():
+            raise ValueError("FAL_KEY environment variable not set")
 
         aspect_lc = (aspect_ratio or DEFAULT_ASPECT_RATIO).lower().strip()
         if aspect_lc not in VALID_ASPECT_RATIOS:
@@ -769,8 +595,8 @@ def image_generate_tool(
 
 
 def check_fal_api_key() -> bool:
-    """True if the FAL.ai API key (direct or managed gateway) is available."""
-    return bool(fal_key_is_configured() or _resolve_managed_fal_gateway())
+    """True if the FAL.ai API key is available."""
+    return bool(fal_key_is_configured())
 
 
 def check_image_generation_requirements() -> bool:
@@ -778,7 +604,7 @@ def check_image_generation_requirements() -> bool:
 
     Providers are considered in this order:
 
-    1. The in-tree FAL backend (FAL_KEY or managed gateway).
+    1. The in-tree FAL backend (FAL_KEY).
     2. Any plugin-registered provider whose ``is_available()`` returns True.
 
     Plugins win only when the in-tree FAL path is NOT ready, which matches

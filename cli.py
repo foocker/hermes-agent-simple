@@ -2573,50 +2573,6 @@ class HermesCLI:
         except Exception:
             pass
 
-        if resolved_provider == "copilot":
-            try:
-                from hermes_cli.models import copilot_model_api_mode, normalize_copilot_model_id
-
-                canonical = normalize_copilot_model_id(current_model, api_key=self.api_key)
-                if canonical and canonical != current_model:
-                    if not self._model_is_default:
-                        self._console_print(
-                            f"[yellow]⚠️  Normalized Copilot model '{current_model}' to '{canonical}'.[/]"
-                        )
-                    self.model = canonical
-                    current_model = canonical
-                    changed = True
-
-                resolved_mode = copilot_model_api_mode(current_model, api_key=self.api_key)
-                if resolved_mode != self.api_mode:
-                    self.api_mode = resolved_mode
-                    changed = True
-            except Exception:
-                pass
-            return changed
-
-        if resolved_provider in {"opencode-zen", "opencode-go"}:
-            try:
-                from hermes_cli.models import normalize_opencode_model_id, opencode_model_api_mode
-
-                canonical = normalize_opencode_model_id(resolved_provider, current_model)
-                if canonical and canonical != current_model:
-                    if not self._model_is_default:
-                        self._console_print(
-                            f"[yellow]⚠️  Stripped provider prefix from '{current_model}'; using '{canonical}' for {resolved_provider}.[/]"
-                        )
-                    self.model = canonical
-                    current_model = canonical
-                    changed = True
-
-                resolved_mode = opencode_model_api_mode(resolved_provider, current_model)
-                if resolved_mode != self.api_mode:
-                    self.api_mode = resolved_mode
-                    changed = True
-            except Exception:
-                pass
-            return changed
-
         if resolved_provider != "openai-codex":
             return changed
 
@@ -3310,10 +3266,9 @@ class HermesCLI:
     def _resolve_turn_agent_config(self, user_message: str) -> dict:
         """Build the effective model/runtime config for a single user turn.
 
-        Always uses the session's primary model/provider.  If the user has
-        toggled `/fast` on and the current model supports Priority
-        Processing / Anthropic fast mode, attach `request_overrides` so the
-        API call is marked accordingly.
+        Always uses the session's primary model/provider. If the user has
+        toggled `/fast` on and the current model supports OpenAI Priority
+        Processing, attach `request_overrides` so the API call is marked accordingly.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -4303,8 +4258,6 @@ class HermesCLI:
             toolsets_info = f" [dim {separator_color}]·[/] [{label_color}]toolsets: {', '.join(self.enabled_toolsets)}[/]"
 
         provider_info = f" [dim {separator_color}]·[/] [dim]provider: {self.provider}[/]"
-        if self._provider_source:
-            provider_info += f" [dim {separator_color}]·[/] [dim]auth: {self._provider_source}[/]"
 
         self._console_print(
             f"  {api_indicator} [{accent_color}]{model_short}[/] "
@@ -5643,52 +5596,6 @@ class HermesCLI:
             return "\n".join(p for p in parts if p)
         return str(value)
 
-    def _handle_gquota_command(self, cmd_original: str) -> None:
-        """Show Google Gemini Code Assist quota usage for the current OAuth account."""
-        try:
-            from agent.google_oauth import get_valid_access_token, GoogleOAuthError, load_credentials
-            from agent.google_code_assist import retrieve_user_quota, CodeAssistError
-        except ImportError as exc:
-            self._console_print(f"  [red]Gemini modules unavailable: {exc}[/]")
-            return
-
-        try:
-            access_token = get_valid_access_token()
-        except GoogleOAuthError as exc:
-            self._console_print(f"  [yellow]{exc}[/]")
-            self._console_print("  Run [bold]/model[/] and pick 'Google Gemini (OAuth)' to sign in.")
-            return
-
-        creds = load_credentials()
-        project_id = (creds.project_id if creds else "") or ""
-
-        try:
-            buckets = retrieve_user_quota(access_token, project_id=project_id)
-        except CodeAssistError as exc:
-            self._console_print(f"  [red]Quota lookup failed:[/] {exc}")
-            return
-
-        if not buckets:
-            self._console_print("  [dim]No quota buckets reported (account may be on legacy/unmetered tier).[/]")
-            return
-
-        # Sort for stable display, group by model
-        buckets.sort(key=lambda b: (b.model_id, b.token_type))
-        self._console_print()
-        self._console_print(f"  [bold]Gemini Code Assist quota[/]  (project: {project_id or '(auto / free-tier)'})")
-        self._console_print()
-        for b in buckets:
-            pct = max(0.0, min(1.0, b.remaining_fraction))
-            width = 20
-            filled = int(round(pct * width))
-            bar = "▓" * filled + "░" * (width - filled)
-            pct_str = f"{int(pct * 100):3d}%"
-            header = b.model_id
-            if b.token_type:
-                header += f" [{b.token_type}]"
-            self._console_print(f"    {header:40s}  {bar}  {pct_str}")
-        self._console_print()
-
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities."""
         parts = cmd.split(maxsplit=1)
@@ -6225,9 +6132,6 @@ class HermesCLI:
             self._handle_resume_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
-        elif canonical == "gquota":
-            self._handle_gquota_command(cmd_original)
-
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
             self._handle_personality_command(cmd_original)
@@ -7082,19 +6986,12 @@ class HermesCLI:
             _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (session only){_RST}")
 
     def _handle_fast_command(self, cmd: str):
-        """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
+        """Handle /fast — toggle OpenAI Priority Processing."""
         if not self._fast_command_available():
-            _cprint("  (._.) /fast is only available for models that support fast mode (OpenAI Priority Processing or Anthropic Fast Mode).")
+            _cprint("  (._.) /fast is only available for models that support OpenAI Priority Processing.")
             return
 
-        # Determine the branding for the current model
-        try:
-            from hermes_cli.models import _is_anthropic_fast_model
-            agent = getattr(self, "agent", None)
-            model = getattr(agent, "model", None) or getattr(self, "model", None)
-            feature_name = "Anthropic Fast Mode" if _is_anthropic_fast_model(model) else "Priority Processing"
-        except Exception:
-            feature_name = "Fast mode"
+        feature_name = "Priority Processing"
 
         parts = cmd.strip().split(maxsplit=1)
         if len(parts) < 2 or parts[1].strip().lower() == "status":

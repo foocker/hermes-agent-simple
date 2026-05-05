@@ -128,6 +128,7 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
+    DEVELOPER_ROLE_MODELS,
     build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
@@ -140,12 +141,15 @@ from agent.model_metadata import (
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
-from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
+    _chat_messages_to_responses_input,
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
+    _normalize_codex_response,
+    _preflight_codex_api_kwargs,
+    _responses_tools,
     _split_responses_tool_id as _codex_split_responses_tool_id,
     _summarize_user_message_for_log,
 )
@@ -345,6 +349,351 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 )
 # Output redirects that overwrite files (> but not >>)
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
+
+
+def _to_plain_dict(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        return dict(value.__dict__)
+    return value
+
+
+class _SimpleChatTransport:
+    """OpenAI-compatible Chat Completions data path for Hermes Simple."""
+
+    def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
+        model_lower = str(kwargs.get("model_lower") or "").lower()
+        needs_copy = False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if "codex_reasoning_items" in msg or "codex_message_items" in msg:
+                needs_copy = True
+                break
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if isinstance(tc, dict) and ("call_id" in tc or "response_item_id" in tc):
+                        needs_copy = True
+                        break
+            if needs_copy:
+                break
+
+        sanitized = copy.deepcopy(messages) if needs_copy else messages
+        if needs_copy:
+            for msg in sanitized:
+                if not isinstance(msg, dict):
+                    continue
+                msg.pop("codex_reasoning_items", None)
+                msg.pop("codex_message_items", None)
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            tc.pop("call_id", None)
+                            tc.pop("response_item_id", None)
+
+        if (
+            sanitized
+            and isinstance(sanitized[0], dict)
+            and sanitized[0].get("role") == "system"
+            and any(prefix in model_lower for prefix in DEVELOPER_ROLE_MODELS)
+        ):
+            sanitized = list(sanitized)
+            sanitized[0] = {**sanitized[0], "role": "developer"}
+        return sanitized
+
+    def build_kwargs(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **params,
+    ) -> Dict[str, Any]:
+        sanitized = self.convert_messages(
+            messages,
+            model_lower=params.get("model_lower", (model or "").lower()),
+        )
+
+        if params.get("is_qwen_portal"):
+            qwen_prep = params.get("qwen_prepare_fn")
+            qwen_prep_inplace = params.get("qwen_prepare_inplace_fn")
+            if sanitized is messages:
+                if qwen_prep is not None:
+                    sanitized = qwen_prep(sanitized)
+            elif qwen_prep_inplace is not None:
+                qwen_prep_inplace(sanitized)
+            elif qwen_prep is not None:
+                sanitized = qwen_prep(sanitized)
+
+        api_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": sanitized,
+        }
+
+        timeout = params.get("timeout")
+        if timeout is not None:
+            api_kwargs["timeout"] = timeout
+
+        fixed_temp = params.get("fixed_temperature")
+        if not params.get("omit_temperature", False) and fixed_temp is not None:
+            api_kwargs["temperature"] = fixed_temp
+
+        if tools:
+            api_kwargs["tools"] = tools
+
+        qwen_meta = params.get("qwen_session_metadata")
+        if qwen_meta and params.get("is_qwen_portal"):
+            api_kwargs["metadata"] = qwen_meta
+
+        max_tokens_fn = params.get("max_tokens_param_fn")
+        ephemeral = params.get("ephemeral_max_output_tokens")
+        max_tokens = params.get("max_tokens")
+        if ephemeral is not None and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(ephemeral))
+        elif max_tokens is not None and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(max_tokens))
+        elif params.get("is_nvidia_nim") and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(16384))
+        elif params.get("is_qwen_portal") and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(65536))
+        elif params.get("is_kimi") and max_tokens_fn:
+            api_kwargs.update(max_tokens_fn(32000))
+
+        reasoning_config = params.get("reasoning_config")
+        if params.get("is_kimi"):
+            thinking_off = bool(
+                reasoning_config
+                and isinstance(reasoning_config, dict)
+                and reasoning_config.get("enabled") is False
+            )
+            if not thinking_off:
+                effort = "medium"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    requested = str(reasoning_config.get("effort") or "").strip().lower()
+                    if requested in {"low", "medium", "high"}:
+                        effort = requested
+                api_kwargs["reasoning_effort"] = effort
+
+        extra_body: Dict[str, Any] = {}
+        provider_prefs = params.get("provider_preferences")
+        if provider_prefs and params.get("is_openrouter"):
+            extra_body["provider"] = provider_prefs
+
+        if params.get("is_kimi"):
+            enabled = not (
+                reasoning_config
+                and isinstance(reasoning_config, dict)
+                and reasoning_config.get("enabled") is False
+            )
+            extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+
+        if params.get("supports_reasoning") and not params.get("is_lmstudio"):
+            if params.get("is_github_models"):
+                github_reasoning = params.get("github_reasoning_extra")
+                if github_reasoning is not None:
+                    extra_body["reasoning"] = github_reasoning
+            elif reasoning_config is not None:
+                if not (params.get("is_nous") and isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False):
+                    extra_body["reasoning"] = dict(reasoning_config)
+            else:
+                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
+
+        if params.get("is_nous"):
+            extra_body["tags"] = ["product=hermes-agent"]
+
+        ollama_ctx = params.get("ollama_num_ctx")
+        if ollama_ctx:
+            options = extra_body.get("options", {})
+            options["num_ctx"] = ollama_ctx
+            extra_body["options"] = options
+
+        if params.get("is_custom_provider") and reasoning_config and isinstance(reasoning_config, dict):
+            effort = str(reasoning_config.get("effort") or "").strip().lower()
+            if effort == "none" or reasoning_config.get("enabled") is False:
+                extra_body["think"] = False
+
+        if params.get("is_qwen_portal"):
+            extra_body["vl_high_resolution_images"] = True
+
+        additions = params.get("extra_body_additions")
+        if additions:
+            extra_body.update(additions)
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
+
+        overrides = params.get("request_overrides")
+        if overrides:
+            api_kwargs.update(overrides)
+
+        return api_kwargs
+
+    def normalize_response(self, response: Any, **kwargs) -> SimpleNamespace:
+        choice = response.choices[0]
+        msg = choice.message
+        finish_reason = choice.finish_reason or "stop"
+
+        tool_calls = None
+        if getattr(msg, "tool_calls", None):
+            tool_calls = []
+            for tc in msg.tool_calls:
+                extra = getattr(tc, "extra_content", None)
+                if extra is None and hasattr(tc, "model_extra"):
+                    extra = (tc.model_extra or {}).get("extra_content")
+                provider_data = {}
+                if extra is not None:
+                    provider_data["extra_content"] = _to_plain_dict(extra)
+                tool_calls.append(SimpleNamespace(
+                    id=tc.id,
+                    call_id=None,
+                    response_item_id=None,
+                    type="function",
+                    extra_content=provider_data.get("extra_content"),
+                    function=SimpleNamespace(
+                        name=tc.function.name,
+                        arguments=tc.function.arguments,
+                    ),
+                ))
+
+        return SimpleNamespace(
+            content=getattr(msg, "content", None),
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            reasoning=getattr(msg, "reasoning", None),
+            reasoning_content=getattr(msg, "reasoning_content", None),
+            reasoning_details=getattr(msg, "reasoning_details", None),
+            codex_reasoning_items=None,
+            codex_message_items=None,
+            usage=getattr(response, "usage", None),
+        )
+
+    def validate_response(self, response: Any) -> bool:
+        return (
+            response is not None
+            and hasattr(response, "choices")
+            and response.choices is not None
+            and bool(response.choices)
+        )
+
+
+class _SimpleCodexTransport:
+    """OpenAI Responses API data path for Hermes Simple."""
+
+    def build_kwargs(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **params,
+    ) -> Dict[str, Any]:
+        instructions = params.get("instructions", "")
+        payload_messages = messages
+        if not instructions and messages and messages[0].get("role") == "system":
+            instructions = str(messages[0].get("content") or "").strip()
+            payload_messages = messages[1:]
+        if not instructions:
+            instructions = DEFAULT_AGENT_IDENTITY
+
+        reasoning_effort = "medium"
+        reasoning_enabled = True
+        reasoning_config = params.get("reasoning_config")
+        if reasoning_config and isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                reasoning_enabled = False
+            elif reasoning_config.get("effort"):
+                reasoning_effort = str(reasoning_config["effort"])
+        if reasoning_effort == "minimal":
+            reasoning_effort = "low"
+
+        is_github_responses = bool(params.get("is_github_responses"))
+        is_codex_backend = bool(params.get("is_codex_backend"))
+        is_xai_responses = bool(params.get("is_xai_responses"))
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "instructions": instructions,
+            "input": _chat_messages_to_responses_input(payload_messages),
+            "tools": _responses_tools(tools),
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "store": False,
+        }
+
+        session_id = params.get("session_id")
+        if not is_github_responses and session_id:
+            kwargs["prompt_cache_key"] = session_id
+
+        if reasoning_enabled and is_xai_responses:
+            kwargs["include"] = ["reasoning.encrypted_content"]
+        elif reasoning_enabled:
+            if is_github_responses:
+                github_reasoning = params.get("github_reasoning_extra")
+                if github_reasoning is not None:
+                    kwargs["reasoning"] = github_reasoning
+            else:
+                kwargs["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
+                kwargs["include"] = ["reasoning.encrypted_content"]
+        elif not is_github_responses and not is_xai_responses:
+            kwargs["include"] = []
+
+        overrides = params.get("request_overrides")
+        if overrides:
+            kwargs.update(overrides)
+
+        if is_codex_backend:
+            cache_scope_id = str(kwargs.get("prompt_cache_key") or session_id or "").strip()
+            if cache_scope_id:
+                extra_headers = dict(kwargs.get("extra_headers") or {})
+                extra_headers["session_id"] = cache_scope_id
+                extra_headers["x-client-request-id"] = cache_scope_id
+                kwargs["extra_headers"] = extra_headers
+
+        max_tokens = params.get("max_tokens")
+        if max_tokens is not None and not is_codex_backend:
+            kwargs["max_output_tokens"] = max_tokens
+
+        if is_xai_responses and session_id:
+            kwargs["extra_headers"] = {"x-grok-conv-id": session_id}
+
+        return kwargs
+
+    def normalize_response(self, response: Any, **kwargs) -> SimpleNamespace:
+        msg, finish_reason = _normalize_codex_response(response)
+        return SimpleNamespace(
+            content=getattr(msg, "content", None),
+            tool_calls=getattr(msg, "tool_calls", None),
+            finish_reason=finish_reason or "stop",
+            reasoning=getattr(msg, "reasoning", None),
+            reasoning_content=getattr(msg, "reasoning_content", None),
+            reasoning_details=getattr(msg, "reasoning_details", None),
+            codex_reasoning_items=getattr(msg, "codex_reasoning_items", None),
+            codex_message_items=getattr(msg, "codex_message_items", None),
+            usage=getattr(response, "usage", None),
+        )
+
+    def validate_response(self, response: Any) -> bool:
+        if response is None:
+            return False
+        output = getattr(response, "output", None)
+        if isinstance(output, list) and output:
+            return True
+        out_text = getattr(response, "output_text", None)
+        return isinstance(out_text, str) and bool(out_text.strip())
+
+    def preflight_kwargs(self, api_kwargs: Any, *, allow_stream: bool = False) -> dict:
+        return _preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+
+    def map_finish_reason(self, raw_reason: str) -> str:
+        return {
+            "completed": "stop",
+            "incomplete": "length",
+            "failed": "stop",
+            "cancelled": "stop",
+        }.get(raw_reason, "stop")
 
 
 def _is_destructive_command(cmd: str) -> bool:
@@ -1026,8 +1375,10 @@ class AIAgent:
         self.provider = provider_name or ""
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
-        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
+        if api_mode in {"chat_completions", "codex_responses"}:
             self.api_mode = api_mode
+        elif api_mode:
+            raise ValueError(f"Unsupported api_mode for Hermes Simple: {api_mode}")
         elif self.provider == "openai-codex":
             self.api_mode = "codex_responses"
         elif self.provider == "xai":
@@ -1041,21 +1392,6 @@ class AIAgent:
         elif (provider_name is None) and self._base_url_hostname == "api.x.ai":
             self.api_mode = "codex_responses"
             self.provider = "xai"
-        elif self.provider == "anthropic" or (provider_name is None and self._base_url_hostname == "api.anthropic.com"):
-            self.api_mode = "anthropic_messages"
-            self.provider = "anthropic"
-        elif self._base_url_lower.rstrip("/").endswith("/anthropic"):
-            # Third-party Anthropic-compatible endpoints (e.g. MiniMax, DashScope)
-            # use a URL convention ending in /anthropic. Auto-detect these so the
-            # Anthropic Messages API adapter is used instead of chat completions.
-            self.api_mode = "anthropic_messages"
-        elif self.provider == "bedrock" or (
-            self._base_url_hostname.startswith("bedrock-runtime.")
-            and base_url_host_matches(self._base_url_lower, "amazonaws.com")
-        ):
-            # AWS Bedrock — auto-detect from provider name or base URL
-            # (bedrock-runtime.<region>.amazonaws.com).
-            self.api_mode = "bedrock_converse"
         else:
             self.api_mode = "chat_completions"
 
@@ -1078,12 +1414,8 @@ class AIAgent:
             pass
 
         # GPT-5.x models usually require the Responses API path, but some
-        # providers have exceptions (for example Copilot's gpt-5-mini still
-        # uses chat completions). Also auto-upgrade for direct OpenAI URLs
-        # (api.openai.com) since all newer tool-calling models prefer
-        # Responses there. ACP runtimes are excluded: CopilotACPClient
-        # handles its own routing and does not implement the Responses API
-        # surface.
+        # Also auto-upgrade for direct OpenAI URLs (api.openai.com) since all
+        # newer tool-calling models prefer Responses there.
         # When api_mode was explicitly provided, respect it — the user
         # knows what their endpoint supports (#10473).
         # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
@@ -1092,9 +1424,6 @@ class AIAgent:
         if (
             api_mode is None
             and self.api_mode == "chat_completions"
-            and self.provider != "copilot-acp"
-            and not str(self.base_url or "").lower().startswith("acp://copilot")
-            and not str(self.base_url or "").lower().startswith("acp+tcp://")
             and not self._is_azure_openai_url()
             and (
                 self._is_direct_openai_url()
@@ -1196,19 +1525,11 @@ class AIAgent:
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
         
-        # Anthropic prompt caching: auto-enabled for Claude models on native
-        # Anthropic, OpenRouter, and third-party gateways that speak the
-        # Anthropic protocol (``api_mode == 'anthropic_messages'``). Reduces
-        # input costs by ~75% on multi-turn conversations. Uses system_and_3
-        # strategy (4 breakpoints). See ``_anthropic_prompt_cache_policy``
-        # for the layout-vs-transport decision.
-        self._use_prompt_caching, self._use_native_cache_layout = (
-            self._anthropic_prompt_cache_policy()
-        )
-        # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from
-        # config.yaml under prompt_caching.cache_ttl; unknown values keep "5m".
-        # 1h tier costs 2x on write vs 1.25x for 5m, but amortizes across long
-        # sessions with >5-minute pauses between turns (#14971).
+        # Hermes Simple keeps prompt-cache marker injection disabled. OpenAI
+        # compatible providers may still report automatic server-side cache
+        # hits in usage details.
+        self._use_prompt_caching = False
+        self._use_native_cache_layout = False
         self._cache_ttl = "5m"
         try:
             from hermes_cli.config import load_config as _load_pc_cfg
@@ -1293,218 +1614,106 @@ class AIAgent:
         # same image history.
         self._anthropic_image_fallback_cache: Dict[str, str] = {}
 
-        # Initialize LLM client via centralized provider router.
-        # The router handles auth resolution, base URL, headers, and
-        # Codex/Anthropic wrapping for all known providers.
-        # raw_codex=True because the main agent needs direct responses.stream()
-        # access for Codex Responses API streaming.
+        # Initialize the OpenAI-compatible client. The simple distribution
+        # supports Chat Completions plus Responses API through the same SDK.
         self._anthropic_client = None
         self._is_anthropic_oauth = False
 
         # Resolve per-provider / per-model request timeout once up front so
-        # every client construction path below (Anthropic native, OpenAI-wire,
-        # router-based implicit auth) can apply it consistently.  Bedrock
-        # Claude uses its own timeout path and is not covered here.
+        # every client construction path applies it consistently.
         _provider_timeout = get_provider_request_timeout(self.provider, self.model)
 
-        if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
-            # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
-            # (prompt caching, thinking budgets, adaptive thinking).
-            _is_bedrock_anthropic = self.provider == "bedrock"
-            if _is_bedrock_anthropic:
-                from agent.anthropic_adapter import build_anthropic_bedrock_client
-                _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
-                _br_region = _region_match.group(1) if _region_match else "us-east-1"
-                self._bedrock_region = _br_region
-                self._anthropic_client = build_anthropic_bedrock_client(_br_region)
-                self._anthropic_api_key = "aws-sdk"
-                self._anthropic_base_url = base_url
-                self._is_anthropic_oauth = False
-                self.api_key = "aws-sdk"
-                self.client = None
-                self._client_kwargs = {}
-                if not self.quiet_mode:
-                    print(f"🤖 AI Agent initialized with model: {self.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region})")
+        if api_key and base_url:
+            # Explicit credentials from CLI/gateway — construct directly.
+            # The runtime provider resolver already handled auth for us.
+            # Extract query params (e.g. Azure api-version) from base_url
+            # and pass via default_query to prevent loss during SDK URL
+            # joining (httpx drops query string when joining paths).
+            _parsed_url = urlparse(base_url)
+            if _parsed_url.query:
+                _clean_url = urlunparse(_parsed_url._replace(query=""))
+                _query_params = {
+                    k: v[0] for k, v in parse_qs(_parsed_url.query).items()
+                }
+                client_kwargs = {
+                    "api_key": api_key,
+                    "base_url": _clean_url,
+                    "default_query": _query_params,
+                }
             else:
-                # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-                # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
-                # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
-                _is_native_anthropic = self.provider == "anthropic"
-                effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
-                self.api_key = effective_key
-                self._anthropic_api_key = effective_key
-                self._anthropic_base_url = base_url
-                # Only mark the session as OAuth-authenticated when the token
-                # genuinely belongs to native Anthropic.  Third-party providers
-                # (MiniMax, Kimi, GLM, LiteLLM proxies) that accept the
-                # Anthropic protocol must never trip OAuth code paths — doing
-                # so injects Claude-Code identity headers and system prompts
-                # that cause 401/403 on their endpoints.  Guards #1739 and
-                # the third-party identity-injection bug.
-                from agent.anthropic_adapter import _is_oauth_token as _is_oat
-                self._is_anthropic_oauth = _is_oat(effective_key) if _is_native_anthropic else False
-                self._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
-                # No OpenAI client needed for Anthropic mode
-                self.client = None
-                self._client_kwargs = {}
-                if not self.quiet_mode:
-                    print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
-                    if effective_key and len(effective_key) > 12:
-                        print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
-        elif self.api_mode == "bedrock_converse":
-            # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
-            # Region is extracted from the base_url or defaults to us-east-1.
-            _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
-            self._bedrock_region = _region_match.group(1) if _region_match else "us-east-1"
-            # Guardrail config — read from config.yaml at init time.
-            self._bedrock_guardrail_config = None
-            try:
-                from hermes_cli.config import load_config as _load_br_cfg
-                _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
-                if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
-                    self._bedrock_guardrail_config = {
-                        "guardrailIdentifier": _gr["guardrail_identifier"],
-                        "guardrailVersion": _gr["guardrail_version"],
-                    }
-                    if _gr.get("stream_processing_mode"):
-                        self._bedrock_guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
-                    if _gr.get("trace"):
-                        self._bedrock_guardrail_config["trace"] = _gr["trace"]
-            except Exception:
-                pass
-            self.client = None
-            self._client_kwargs = {}
-            if not self.quiet_mode:
-                _gr_label = " + Guardrails" if self._bedrock_guardrail_config else ""
-                print(f"🤖 AI Agent initialized with model: {self.model} (AWS Bedrock, {self._bedrock_region}{_gr_label})")
+                client_kwargs = {"api_key": api_key, "base_url": base_url}
+            if _provider_timeout is not None:
+                client_kwargs["timeout"] = _provider_timeout
+            effective_base = base_url
+            if base_url_host_matches(effective_base, "openrouter.ai"):
+                client_kwargs["default_headers"] = {
+                    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+                    "X-OpenRouter-Title": "Hermes Agent",
+                    "X-OpenRouter-Categories": "productivity,cli-agent",
+                }
+            elif base_url_host_matches(effective_base, "api.routermint.com"):
+                client_kwargs["default_headers"] = _routermint_headers()
+            elif base_url_host_matches(effective_base, "api.kimi.com"):
+                client_kwargs["default_headers"] = {
+                    "User-Agent": "claude-code/0.1.0",
+                }
+            elif base_url_host_matches(effective_base, "portal.qwen.ai"):
+                client_kwargs["default_headers"] = _qwen_portal_headers()
+            elif base_url_host_matches(effective_base, "chatgpt.com"):
+                from agent.auxiliary_client import _codex_cloudflare_headers
+                client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
         else:
-            if api_key and base_url:
-                # Explicit credentials from CLI/gateway — construct directly.
-                # The runtime provider resolver already handled auth for us.
-                # Extract query params (e.g. Azure api-version) from base_url
-                # and pass via default_query to prevent loss during SDK URL
-                # joining (httpx drops query string when joining paths).
-                _parsed_url = urlparse(base_url)
-                if _parsed_url.query:
-                    _clean_url = urlunparse(_parsed_url._replace(query=""))
-                    _query_params = {
-                        k: v[0] for k, v in parse_qs(_parsed_url.query).items()
-                    }
-                    client_kwargs = {
-                        "api_key": api_key,
-                        "base_url": _clean_url,
-                        "default_query": _query_params,
-                    }
-                else:
-                    client_kwargs = {"api_key": api_key, "base_url": base_url}
+            # No explicit creds — use the centralized provider router.
+            from agent.auxiliary_client import resolve_provider_client
+            _routed_client, _ = resolve_provider_client(
+                self.provider or "auto", model=self.model, raw_codex=True)
+            if _routed_client is not None:
+                client_kwargs = {
+                    "api_key": _routed_client.api_key,
+                    "base_url": str(_routed_client.base_url),
+                }
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
-                if self.provider == "copilot-acp":
-                    client_kwargs["command"] = self.acp_command
-                    client_kwargs["args"] = self.acp_args
-                effective_base = base_url
-                if base_url_host_matches(effective_base, "openrouter.ai"):
-                    client_kwargs["default_headers"] = {
-                        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-                        "X-OpenRouter-Title": "Hermes Agent",
-                        "X-OpenRouter-Categories": "productivity,cli-agent",
-                    }
-                elif base_url_host_matches(effective_base, "api.routermint.com"):
-                    client_kwargs["default_headers"] = _routermint_headers()
-                elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
-                    from hermes_cli.models import copilot_default_headers
-
-                    client_kwargs["default_headers"] = copilot_default_headers()
-                elif base_url_host_matches(effective_base, "api.kimi.com"):
-                    client_kwargs["default_headers"] = {
-                        "User-Agent": "claude-code/0.1.0",
-                    }
-                elif base_url_host_matches(effective_base, "portal.qwen.ai"):
-                    client_kwargs["default_headers"] = _qwen_portal_headers()
-                elif base_url_host_matches(effective_base, "chatgpt.com"):
-                    from agent.auxiliary_client import _codex_cloudflare_headers
-                    client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+                if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
+                    client_kwargs["default_headers"] = dict(_routed_client._default_headers)
             else:
-                # No explicit creds — use the centralized provider router
-                from agent.auxiliary_client import resolve_provider_client
-                _routed_client, _ = resolve_provider_client(
-                    self.provider or "auto", model=self.model, raw_codex=True)
-                if _routed_client is not None:
-                    client_kwargs = {
-                        "api_key": _routed_client.api_key,
-                        "base_url": str(_routed_client.base_url),
-                    }
-                    if _provider_timeout is not None:
-                        client_kwargs["timeout"] = _provider_timeout
-                    # Preserve any default_headers the router set
-                    if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
-                        client_kwargs["default_headers"] = dict(_routed_client._default_headers)
-                else:
-                    # When the user explicitly chose a non-OpenRouter provider
-                    # but no credentials were found, fail fast with a clear
-                    # message instead of silently routing through OpenRouter.
-                    _explicit = (self.provider or "").strip().lower()
-                    if _explicit and _explicit not in ("auto", "openrouter", "custom"):
-                        # Look up the actual env var name from the provider
-                        # config — some providers use non-standard names
-                        # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
-                        _env_hint = f"{_explicit.upper()}_API_KEY"
-                        try:
-                            from hermes_cli.auth import PROVIDER_REGISTRY
-                            _pcfg = PROVIDER_REGISTRY.get(_explicit)
-                            if _pcfg and _pcfg.api_key_env_vars:
-                                _env_hint = _pcfg.api_key_env_vars[0]
-                        except Exception:
-                            pass
-                        raise RuntimeError(
-                            f"Provider '{_explicit}' is set in config.yaml but no API key "
-                            f"was found. Set the {_env_hint} environment "
-                            f"variable, or switch to a different provider with `hermes model`."
-                        )
-                    # No provider configured — reject with a clear message.
+                _explicit = (self.provider or "").strip().lower()
+                if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+                    _env_hint = f"{_explicit.upper()}_API_KEY"
+                    try:
+                        from hermes_cli.auth import PROVIDER_REGISTRY
+                        _pcfg = PROVIDER_REGISTRY.get(_explicit)
+                        if _pcfg and _pcfg.api_key_env_vars:
+                            _env_hint = _pcfg.api_key_env_vars[0]
+                    except Exception:
+                        pass
                     raise RuntimeError(
-                        "No LLM provider configured. Run `hermes model` to "
-                        "select a provider, or run `hermes setup` for first-time "
-                        "configuration."
+                        f"Provider '{_explicit}' is set in config.yaml but no API key "
+                        f"was found. Set the {_env_hint} environment "
+                        f"variable, or switch to a different provider with `hermes model`."
                     )
-            
-            self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
+                raise RuntimeError(
+                    "No LLM provider configured. Run `hermes model` to "
+                    "select a provider, or run `hermes setup` for first-time "
+                    "configuration."
+                )
 
-            # Enable fine-grained tool streaming for Claude on OpenRouter.
-            # Without this, Anthropic buffers the entire tool call and goes
-            # silent for minutes while thinking — OpenRouter's upstream proxy
-            # times out during the silence.  The beta header makes Anthropic
-            # stream tool call arguments token-by-token, keeping the
-            # connection alive.
-            _effective_base = str(client_kwargs.get("base_url", "")).lower()
-            if base_url_host_matches(_effective_base, "openrouter.ai") and "claude" in (self.model or "").lower():
-                headers = client_kwargs.get("default_headers") or {}
-                existing_beta = headers.get("x-anthropic-beta", "")
-                _FINE_GRAINED = "fine-grained-tool-streaming-2025-05-14"
-                if _FINE_GRAINED not in existing_beta:
-                    if existing_beta:
-                        headers["x-anthropic-beta"] = f"{existing_beta},{_FINE_GRAINED}"
-                    else:
-                        headers["x-anthropic-beta"] = _FINE_GRAINED
-                    client_kwargs["default_headers"] = headers
-
-            self.api_key = client_kwargs.get("api_key", "")
-            self.base_url = client_kwargs.get("base_url", self.base_url)
-            try:
-                self.client = self._create_openai_client(client_kwargs, reason="agent_init", shared=True)
-                if not self.quiet_mode:
-                    print(f"🤖 AI Agent initialized with model: {self.model}")
-                    if base_url:
-                        print(f"🔗 Using custom base URL: {base_url}")
-                    # Always show API key info (masked) for debugging auth issues
-                    key_used = client_kwargs.get("api_key", "none")
-                    if key_used and key_used != "dummy-key" and len(key_used) > 12:
-                        print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
-                    else:
-                        print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
-            except Exception as e:
-                raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
+        self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
+        self.api_key = client_kwargs.get("api_key", "")
+        self.base_url = client_kwargs.get("base_url", self.base_url)
+        try:
+            self.client = self._create_openai_client(client_kwargs, reason="agent_init", shared=True)
+            if not self.quiet_mode:
+                print(f"🤖 AI Agent initialized with model: {self.model}")
+                if base_url:
+                    print(f"🔗 Using custom base URL: {base_url}")
+                key_used = client_kwargs.get("api_key", "none")
+                if key_used and key_used != "dummy-key" and len(key_used) > 12:
+                    print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
+                else:
+                    print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
         # Provider fallback chain — ordered list of backup providers tried
         # when the primary is exhausted (rate-limit, overload, connection
@@ -2107,13 +2316,6 @@ class AIAgent:
             "compressor_context_length": _cc.context_length,
             "compressor_threshold_tokens": _cc.threshold_tokens,
         }
-        if self.api_mode == "anthropic_messages":
-            self._primary_runtime.update({
-                "anthropic_api_key": self._anthropic_api_key,
-                "anthropic_base_url": self._anthropic_base_url,
-                "is_anthropic_oauth": self._is_anthropic_oauth,
-            })
-
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
         
@@ -2206,18 +2408,8 @@ class AIAgent:
         if not api_mode:
             api_mode = determine_api_mode(new_provider, base_url)
 
-        # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
-        # /v1 into the anthropic_messages client, which would cause the SDK to
-        # hit /v1/v1/messages.  `model_switch.switch_model()` already strips
-        # this, but we guard here so any direct callers (future code paths,
-        # tests) can't reintroduce the double-/v1 404 bug.
-        if (
-            api_mode == "anthropic_messages"
-            and new_provider in ("opencode-zen", "opencode-go")
-            and isinstance(base_url, str)
-            and base_url
-        ):
-            base_url = re.sub(r"/v1/?$", "", base_url)
+        if api_mode not in {"chat_completions", "codex_responses"}:
+            raise ValueError(f"Unsupported api_mode for Hermes Simple: {api_mode}")
 
         old_model = self.model
         old_provider = self.provider
@@ -2234,42 +2426,20 @@ class AIAgent:
             self.api_key = api_key
 
         # ── Build new client ──
-        if api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import (
-                build_anthropic_client,
-                resolve_anthropic_token,
-                _is_oauth_token,
-            )
-            # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-            # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
-            # API key — falling back would send Anthropic credentials to third-party endpoints.
-            _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or self.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or self.api_key or "")
-            self.api_key = effective_key
-            self._anthropic_api_key = effective_key
-            self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
-            self._anthropic_client = build_anthropic_client(
-                effective_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-            self._is_anthropic_oauth = _is_oauth_token(effective_key) if _is_native_anthropic else False
-            self.client = None
-            self._client_kwargs = {}
-        else:
-            effective_key = api_key or self.api_key
-            effective_base = base_url or self.base_url
-            self._client_kwargs = {
-                "api_key": effective_key,
-                "base_url": effective_base,
-            }
-            _sm_timeout = get_provider_request_timeout(self.provider, self.model)
-            if _sm_timeout is not None:
-                self._client_kwargs["timeout"] = _sm_timeout
-            self.client = self._create_openai_client(
-                dict(self._client_kwargs),
-                reason="switch_model",
-                shared=True,
-            )
+        effective_key = api_key or self.api_key
+        effective_base = base_url or self.base_url
+        self._client_kwargs = {
+            "api_key": effective_key,
+            "base_url": effective_base,
+        }
+        _sm_timeout = get_provider_request_timeout(self.provider, self.model)
+        if _sm_timeout is not None:
+            self._client_kwargs["timeout"] = _sm_timeout
+        self.client = self._create_openai_client(
+            dict(self._client_kwargs),
+            reason="switch_model",
+            shared=True,
+        )
 
         # ── Re-evaluate prompt caching ──
         self._use_prompt_caching, self._use_native_cache_layout = (
@@ -2335,24 +2505,12 @@ class AIAgent:
             "compressor_context_length": _cc.context_length if _cc else 0,
             "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
         }
-        if api_mode == "anthropic_messages":
-            self._primary_runtime.update({
-                "anthropic_api_key": self._anthropic_api_key,
-                "anthropic_base_url": self._anthropic_base_url,
-                "is_anthropic_oauth": self._is_anthropic_oauth,
-            })
-
         # ── Reset fallback state ──
         self._fallback_activated = False
         self._fallback_index = 0
 
-        # When the user deliberately swaps primary providers (e.g. openrouter
-        # → anthropic), drop any fallback entries that target the OLD primary
-        # or the NEW one.  The chain was seeded from config at agent init for
-        # the original provider — without pruning, a failed turn on the new
-        # primary silently re-activates the provider the user just rejected,
-        # which is exactly what was reported during TUI v2 blitz testing
-        # ("switched to anthropic, tui keeps trying openrouter").
+        # When the user deliberately swaps primary providers, drop any fallback
+        # entries that target the OLD primary or the NEW one.
         old_norm = (old_provider or "").strip().lower()
         new_norm = (new_provider or "").strip().lower()
         fallback_chain = list(getattr(self, "_fallback_chain", []) or [])
@@ -2785,87 +2943,7 @@ class AIAgent:
         api_mode: Optional[str] = None,
         model: Optional[str] = None,
     ) -> tuple[bool, bool]:
-        """Decide whether to apply Anthropic prompt caching and which layout to use.
-
-        Returns ``(should_cache, use_native_layout)``:
-          * ``should_cache`` — inject ``cache_control`` breakpoints for this
-            request (applies to OpenRouter Claude, native Anthropic, and
-            third-party gateways that speak the native Anthropic protocol).
-          * ``use_native_layout`` — place markers on the *inner* content
-            blocks (native Anthropic accepts and requires this layout);
-            when False markers go on the message envelope (OpenRouter and
-            OpenAI-wire proxies expect the looser layout).
-
-        Third-party providers using the native Anthropic transport
-        (``api_mode == 'anthropic_messages'`` + Claude-named model) get
-        caching with the native layout so they benefit from the same
-        cost reduction as direct Anthropic callers, provided their
-        gateway implements the Anthropic cache_control contract
-        (MiniMax, Zhipu GLM, LiteLLM's Anthropic proxy mode all do).
-
-        Qwen / Alibaba-family models on OpenCode, OpenCode Go, and direct
-        Alibaba (DashScope) also honour Anthropic-style ``cache_control``
-        markers on OpenAI-wire chat completions. Upstream pi-mono #3392 /
-        pi #3393 documented this for opencode-go Qwen. Without markers
-        these providers serve zero cache hits, re-billing the full prompt
-        on every turn.
-        """
-        eff_provider = (provider if provider is not None else self.provider) or ""
-        eff_base_url = base_url if base_url is not None else (self.base_url or "")
-        eff_api_mode = api_mode if api_mode is not None else (self.api_mode or "")
-        eff_model = (model if model is not None else self.model) or ""
-
-        model_lower = eff_model.lower()
-        provider_lower = eff_provider.lower()
-        is_claude = "claude" in model_lower
-        is_openrouter = base_url_host_matches(eff_base_url, "openrouter.ai")
-        is_anthropic_wire = eff_api_mode == "anthropic_messages"
-        is_native_anthropic = (
-            is_anthropic_wire
-            and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
-        )
-
-        if is_native_anthropic:
-            return True, True
-        if is_openrouter and is_claude:
-            return True, False
-        if is_anthropic_wire and is_claude:
-            # Third-party Anthropic-compatible gateway.
-            return True, True
-
-        # MiniMax on its Anthropic-compatible endpoint serves its own
-        # model family (MiniMax-M2.7, M2.5, M2.1, M2) with documented
-        # cache_control support (0.1× read pricing, 5-minute TTL).  The
-        # blanket is_claude gate above excludes these — opt them in
-        # explicitly via provider id or host match so users on
-        # provider=minimax / minimax-cn (or custom endpoints pointing at
-        # api.minimax.io/anthropic / api.minimaxi.com/anthropic) get the
-        # same cost reduction as Claude traffic.
-        # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
-        if is_anthropic_wire:
-            is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
-            is_minimax_host = (
-                base_url_host_matches(eff_base_url, "api.minimax.io")
-                or base_url_host_matches(eff_base_url, "api.minimaxi.com")
-            )
-            if is_minimax_provider or is_minimax_host:
-                return True, True
-
-        # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
-        # transport that accepts Anthropic-style cache_control markers and
-        # rewards them with real cache hits.  Without this branch
-        # qwen3.6-plus on opencode-go reports 0% cached tokens and burns
-        # through the subscription on every turn.
-        model_is_qwen = "qwen" in model_lower
-        provider_is_alibaba_family = provider_lower in {
-            "opencode", "opencode-zen", "opencode-go", "alibaba",
-        }
-        if provider_is_alibaba_family and model_is_qwen:
-            # Envelope layout (native_anthropic=False): markers on inner
-            # content parts, not top-level tool messages.  Matches
-            # pi-mono's "alibaba" cacheControlFormat.
-            return True, False
-
+        """Prompt-cache marker injection is disabled in Hermes Simple."""
         return False, False
 
     @staticmethod
@@ -2890,15 +2968,6 @@ class AIAgent:
         provider: Optional[str] = None,
     ) -> bool:
         """Return True when this provider/model pair should use Responses API."""
-        normalized_provider = (provider or "").strip().lower()
-        if normalized_provider == "copilot":
-            try:
-                from hermes_cli.models import _should_use_copilot_responses_api
-                return _should_use_copilot_responses_api(model)
-            except Exception:
-                # Fall back to the generic GPT-5 rule if Copilot-specific
-                # logic is unavailable for any reason.
-                pass
         return AIAgent._model_requires_responses_api(model)
 
     def _max_tokens_param(self, value: int) -> dict:
@@ -5382,54 +5451,6 @@ class AIAgent:
         client_kwargs = dict(client_kwargs)
         _validate_proxy_env_urls()
         _validate_base_url(client_kwargs.get("base_url"))
-        if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
-            from agent.copilot_acp_client import CopilotACPClient
-
-            client = CopilotACPClient(**client_kwargs)
-            logger.info(
-                "Copilot ACP client created (%s, shared=%s) %s",
-                reason,
-                shared,
-                self._client_log_context(),
-            )
-            return client
-        if self.provider == "google-gemini-cli" or str(client_kwargs.get("base_url", "")).startswith("cloudcode-pa://"):
-            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
-
-            # Strip OpenAI-specific kwargs the Gemini client doesn't accept
-            safe_kwargs = {
-                k: v for k, v in client_kwargs.items()
-                if k in {"api_key", "base_url", "default_headers", "project_id", "timeout"}
-            }
-            client = GeminiCloudCodeClient(**safe_kwargs)
-            logger.info(
-                "Gemini Cloud Code Assist client created (%s, shared=%s) %s",
-                reason,
-                shared,
-                self._client_log_context(),
-            )
-            return client
-        if self.provider == "gemini":
-            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-
-            base_url = str(client_kwargs.get("base_url", "") or "")
-            if is_native_gemini_base_url(base_url):
-                safe_kwargs = {
-                    k: v for k, v in client_kwargs.items()
-                    if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
-                }
-                if "http_client" not in safe_kwargs:
-                    keepalive_http = self._build_keepalive_http_client(base_url)
-                    if keepalive_http is not None:
-                        safe_kwargs["http_client"] = keepalive_http
-                client = GeminiNativeClient(**safe_kwargs)
-                logger.info(
-                    "Gemini native client created (%s, shared=%s) %s",
-                    reason,
-                    shared,
-                    self._client_log_context(),
-                )
-                return client
         # Inject TCP keepalives so the kernel detects dead provider connections
         # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
         # this, a peer that drops mid-stream leaves the socket in a state where
@@ -5675,11 +5696,6 @@ class AIAgent:
 
         return any(_contains_image(item) for item in candidates)
 
-    def _copilot_headers_for_request(self, *, is_vision: bool) -> dict:
-        from hermes_cli.copilot_auth import copilot_request_headers
-
-        return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
-
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
@@ -5688,11 +5704,6 @@ class AIAgent:
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
-        if (
-            base_url_host_matches(str(request_kwargs.get("base_url", "")), "api.githubcopilot.com")
-            and self._api_kwargs_have_image_parts(api_kwargs or {})
-        ):
-            request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
@@ -5966,90 +5977,10 @@ class AIAgent:
         return True
 
     def _try_refresh_copilot_client_credentials(self) -> bool:
-        """Refresh Copilot credentials and rebuild the shared OpenAI client.
-
-        Copilot tokens may remain the same string across refreshes (`gh auth token`
-        returns a stable OAuth token in many setups). We still rebuild the client
-        on 401 so retries recover from stale auth/client state without requiring
-        a session restart.
-        """
-        if self.provider != "copilot":
-            return False
-
-        try:
-            from hermes_cli.copilot_auth import resolve_copilot_token
-
-            new_token, token_source = resolve_copilot_token()
-        except Exception as exc:
-            logger.debug("Copilot credential refresh failed: %s", exc)
-            return False
-
-        if not isinstance(new_token, str) or not new_token.strip():
-            return False
-
-        new_token = new_token.strip()
-
-        self.api_key = new_token
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-        self._apply_client_headers_for_base_url(str(self.base_url or ""))
-
-        if not self._replace_primary_openai_client(reason="copilot_credential_refresh"):
-            return False
-
-        logger.info("Copilot credentials refreshed from %s", token_source)
-        return True
+        return False
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
-        if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
-            return False
-        # Only refresh credentials for the native Anthropic provider.
-        # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
-        if self.provider != "anthropic":
-            return False
-        # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
-        # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
-        _base = getattr(self, "_anthropic_base_url", "") or ""
-        if "azure.com" in _base:
-            return False
-
-        try:
-            from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
-
-            new_token = resolve_anthropic_token()
-        except Exception as exc:
-            logger.debug("Anthropic credential refresh failed: %s", exc)
-            return False
-
-        if not isinstance(new_token, str) or not new_token.strip():
-            return False
-        new_token = new_token.strip()
-        if new_token == self._anthropic_api_key:
-            return False
-
-        try:
-            self._anthropic_client.close()
-        except Exception:
-            pass
-
-        try:
-            self._anthropic_client = build_anthropic_client(
-                new_token,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-        except Exception as exc:
-            logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
-            return False
-
-        self._anthropic_api_key = new_token
-        # Update OAuth flag — token type may have changed (API key ↔ OAuth).
-        # Only treat as OAuth on native Anthropic; third-party endpoints using
-        # the Anthropic protocol must not trip OAuth paths (#1739 & third-party
-        # identity-injection guard).
-        from agent.anthropic_adapter import _is_oauth_token
-        self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
-        return True
+        return False
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
         from agent.auxiliary_client import _AI_GATEWAY_HEADERS, _OR_HEADERS
@@ -6060,10 +5991,6 @@ class AIAgent:
             self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
-        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
-            from hermes_cli.models import copilot_default_headers
-
-            self._client_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
             self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
@@ -6079,25 +6006,6 @@ class AIAgent:
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
-
-        if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
-
-            try:
-                self._anthropic_client.close()
-            except Exception:
-                pass
-
-            self._anthropic_api_key = runtime_key
-            self._anthropic_base_url = runtime_base
-            self._anthropic_client = build_anthropic_client(
-                runtime_key, runtime_base,
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
-            self.api_key = runtime_key
-            self.base_url = runtime_base
-            return
 
         self.api_key = runtime_key
         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
@@ -6190,36 +6098,8 @@ class AIAgent:
 
         return False, has_retried_429
 
-    def _anthropic_messages_create(self, api_kwargs: dict):
-        if self.api_mode == "anthropic_messages":
-            self._try_refresh_anthropic_client_credentials()
-        return self._anthropic_client.messages.create(**api_kwargs)
-
     def _rebuild_anthropic_client(self) -> None:
-        """Rebuild the Anthropic client after an interrupt or stale call.
-
-        Handles both direct Anthropic and Bedrock-hosted Anthropic models
-        correctly — rebuilding with the Bedrock SDK when provider is bedrock,
-        rather than always falling back to build_anthropic_client() which
-        requires a direct Anthropic API key.
-
-        Honors ``self._oauth_1m_beta_disabled`` (set by the reactive recovery
-        path when an OAuth subscription rejects the 1M-context beta) so the
-        rebuilt client carries the reduced beta set.
-        """
-        _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
-        if getattr(self, "provider", None) == "bedrock":
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-            region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
-        else:
-            from agent.anthropic_adapter import build_anthropic_client
-            self._anthropic_client = build_anthropic_client(
-                self._anthropic_api_key,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
-            )
+        return None
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """
@@ -6250,31 +6130,6 @@ class AIAgent:
                         client=request_client_holder["client"],
                         on_first_delta=getattr(self, "_codex_on_first_delta", None),
                     )
-                elif self.api_mode == "anthropic_messages":
-                    result["response"] = self._anthropic_messages_create(api_kwargs)
-                elif self.api_mode == "bedrock_converse":
-                    # Bedrock uses boto3 directly — no OpenAI client needed.
-                    # normalize_converse_response produces an OpenAI-compatible
-                    # SimpleNamespace so the rest of the agent loop can treat
-                    # bedrock responses like chat_completions responses.
-                    from agent.bedrock_adapter import (
-                        _get_bedrock_runtime_client,
-                        invalidate_runtime_client,
-                        is_stale_connection_error,
-                        normalize_converse_response,
-                    )
-                    region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-                    api_kwargs.pop("__bedrock_converse__", None)
-                    client = _get_bedrock_runtime_client(region)
-                    try:
-                        raw_response = client.converse(**api_kwargs)
-                    except Exception as _bedrock_exc:
-                        # Evict the cached client on stale-connection failures
-                        # so the outer retry loop builds a fresh client/pool.
-                        if is_stale_connection_error(_bedrock_exc):
-                            invalidate_runtime_client(region)
-                        raise
-                    result["response"] = normalize_converse_response(raw_response)
                 else:
                     request_client_holder["client"] = self._create_request_openai_client(
                         reason="chat_completion_request",
@@ -6333,13 +6188,9 @@ class AIAgent:
                     f"Aborting call."
                 )
                 try:
-                    if self.api_mode == "anthropic_messages":
-                        self._anthropic_client.close()
-                        self._rebuild_anthropic_client()
-                    else:
-                        rc = request_client_holder.get("client")
-                        if rc is not None:
-                            self._close_request_openai_client(rc, reason="stale_call_kill")
+                    rc = request_client_holder.get("client")
+                    if rc is not None:
+                        self._close_request_openai_client(rc, reason="stale_call_kill")
                 except Exception:
                     pass
                 self._touch_activity(
@@ -6359,13 +6210,9 @@ class AIAgent:
                 # token generation without poisoning the shared client used to
                 # seed future retries.
                 try:
-                    if self.api_mode == "anthropic_messages":
-                        self._anthropic_client.close()
-                        self._rebuild_anthropic_client()
-                    else:
-                        request_client = request_client_holder.get("client")
-                        if request_client is not None:
-                            self._close_request_openai_client(request_client, reason="interrupt_abort")
+                    request_client = request_client_holder.get("client")
+                    if request_client is not None:
+                        self._close_request_openai_client(request_client, reason="interrupt_abort")
                 except Exception:
                     pass
                 raise InterruptedError("Agent interrupted during API call")
@@ -6510,9 +6357,8 @@ class AIAgent:
     ):
         """Streaming variant of _interruptible_api_call for real-time token delivery.
 
-        Handles all three api_modes:
+        Handles both simple api_modes:
         - chat_completions: stream=True on OpenAI-compatible endpoints
-        - anthropic_messages: client.messages.stream() via Anthropic SDK
         - codex_responses: delegates to _run_codex_stream (already streaming)
 
         Fires stream_delta_callback and _stream_callback for each text token.
@@ -6536,74 +6382,6 @@ class AIAgent:
                 return self._interruptible_api_call(api_kwargs)
             finally:
                 self._codex_on_first_delta = None
-
-        # Bedrock Converse uses boto3's converse_stream() with real-time delta
-        # callbacks — same UX as Anthropic and chat_completions streaming.
-        if self.api_mode == "bedrock_converse":
-            result = {"response": None, "error": None}
-            first_delta_fired = {"done": False}
-            deltas_were_sent = {"yes": False}
-
-            def _fire_first():
-                if not first_delta_fired["done"] and on_first_delta:
-                    first_delta_fired["done"] = True
-                    try:
-                        on_first_delta()
-                    except Exception:
-                        pass
-
-            def _bedrock_call():
-                try:
-                    from agent.bedrock_adapter import (
-                        _get_bedrock_runtime_client,
-                        invalidate_runtime_client,
-                        is_stale_connection_error,
-                        stream_converse_with_callbacks,
-                    )
-                    region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-                    api_kwargs.pop("__bedrock_converse__", None)
-                    client = _get_bedrock_runtime_client(region)
-                    try:
-                        raw_response = client.converse_stream(**api_kwargs)
-                    except Exception as _bedrock_exc:
-                        # Evict the cached client on stale-connection failures
-                        # so the outer retry loop builds a fresh client/pool.
-                        if is_stale_connection_error(_bedrock_exc):
-                            invalidate_runtime_client(region)
-                        raise
-
-                    def _on_text(text):
-                        _fire_first()
-                        self._fire_stream_delta(text)
-                        deltas_were_sent["yes"] = True
-
-                    def _on_tool(name):
-                        _fire_first()
-                        self._fire_tool_gen_started(name)
-
-                    def _on_reasoning(text):
-                        _fire_first()
-                        self._fire_reasoning_delta(text)
-
-                    result["response"] = stream_converse_with_callbacks(
-                        raw_response,
-                        on_text_delta=_on_text if self._has_stream_consumers() else None,
-                        on_tool_start=_on_tool,
-                        on_reasoning_delta=_on_reasoning if self.reasoning_callback or self.stream_delta_callback else None,
-                        on_interrupt_check=lambda: self._interrupt_requested,
-                    )
-                except Exception as e:
-                    result["error"] = e
-
-            t = threading.Thread(target=_bedrock_call, daemon=True)
-            t.start()
-            while t.is_alive():
-                t.join(timeout=0.3)
-                if self._interrupt_requested:
-                    raise InterruptedError("Agent interrupted during Bedrock API call")
-            if result["error"] is not None:
-                raise result["error"]
-            return result["response"]
 
         result = {"response": None, "error": None, "partial_tool_names": []}
         request_client_holder = {"client": None}
@@ -6948,11 +6726,7 @@ class AIAgent:
                     if self._interrupt_requested:
                         raise InterruptedError("Agent interrupted before stream retry")
                     try:
-                        if self.api_mode == "anthropic_messages":
-                            self._try_refresh_anthropic_client_credentials()
-                            result["response"] = _call_anthropic()
-                        else:
-                            result["response"] = _call_chat_completions()
+                        result["response"] = _call_chat_completions()
                         return  # success
                     except Exception as e:
                         _is_timeout = isinstance(
@@ -7278,13 +7052,9 @@ class AIAgent:
 
             if self._interrupt_requested:
                 try:
-                    if self.api_mode == "anthropic_messages":
-                        self._anthropic_client.close()
-                        self._rebuild_anthropic_client()
-                    else:
-                        request_client = request_client_holder.get("client")
-                        if request_client is not None:
-                            self._close_request_openai_client(request_client, reason="stream_interrupt_abort")
+                    request_client = request_client_holder.get("client")
+                    if request_client is not None:
+                        self._close_request_openai_client(request_client, reason="stream_interrupt_abort")
                 except Exception:
                     pass
                 raise InterruptedError("Agent interrupted during streaming API call")
@@ -7870,8 +7640,7 @@ class AIAgent:
     def _get_transport(self, api_mode: str = None):
         """Return the cached transport for the given (or current) api_mode.
 
-        Lazy-initializes on first call per api_mode. Returns None if no
-        transport is registered for the mode.
+        Lazy-initializes on first call per api_mode.
         """
         mode = api_mode or self.api_mode
         cache = getattr(self, "_transport_cache", None)
@@ -7880,12 +7649,16 @@ class AIAgent:
             self._transport_cache = cache
         t = cache.get(mode)
         if t is None:
-            from agent.transports import get_transport
-            t = get_transport(mode)
+            if mode == "codex_responses":
+                t = _SimpleCodexTransport()
+            elif mode == "chat_completions":
+                t = _SimpleChatTransport()
+            else:
+                raise ValueError(f"Unsupported api_mode for Hermes Simple: {mode}")
             cache[mode] = t
         return t
 
-    def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
+    def _prepare_native_messages_for_api(self, api_messages: list) -> list:
         # Fast exit when no message carries image content at all.
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -8155,43 +7928,6 @@ class AIAgent:
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
-        if self.api_mode == "anthropic_messages":
-            _transport = self._get_transport()
-            anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
-            ctx_len = getattr(self, "context_compressor", None)
-            ctx_len = ctx_len.context_length if ctx_len else None
-            ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
-            if ephemeral_out is not None:
-                self._ephemeral_max_output_tokens = None  # consume immediately
-            return _transport.build_kwargs(
-                model=self.model,
-                messages=anthropic_messages,
-                tools=self.tools,
-                max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
-                reasoning_config=self.reasoning_config,
-                is_oauth=self._is_anthropic_oauth,
-                preserve_dots=self._anthropic_preserve_dots(),
-                context_length=ctx_len,
-                base_url=getattr(self, "_anthropic_base_url", None),
-                fast_mode=(self.request_overrides or {}).get("speed") == "fast",
-                drop_context_1m_beta=bool(getattr(self, "_oauth_1m_beta_disabled", False)),
-            )
-
-        # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
-        # The adapter handles message/tool conversion and boto3 calls directly.
-        if self.api_mode == "bedrock_converse":
-            _bt = self._get_transport()
-            region = getattr(self, "_bedrock_region", None) or "us-east-1"
-            guardrail = getattr(self, "_bedrock_guardrail_config", None)
-            return _bt.build_kwargs(
-                model=self.model,
-                messages=api_messages,
-                tools=self.tools,
-                max_tokens=self.max_tokens or 4096,
-                region=region,
-                guardrail_config=guardrail,
-            )
-
         if self.api_mode == "codex_responses":
             _ct = self._get_transport()
             is_github_responses = (
@@ -8267,14 +8003,7 @@ class AIAgent:
         if self.provider_data_collection:
             _prefs["data_collection"] = self.provider_data_collection
 
-        # Anthropic max output for Claude on OpenRouter/Nous
         _ant_max = None
-        if (_is_or or _is_nous) and "claude" in (self.model or "").lower():
-            try:
-                from agent.anthropic_adapter import _get_anthropic_max_output
-                _ant_max = _get_anthropic_max_output(self.model)
-            except Exception:
-                pass  # fail open — let the proxy pick its default
 
         # Qwen session metadata precomputed here (promptId is per-call random)
         _qwen_meta = None
@@ -8409,14 +8138,10 @@ class AIAgent:
         """Resolve a safe top-level ``reasoning_effort`` for LM Studio.
 
         The iteration-limit summary path calls ``chat.completions.create()``
-        directly, bypassing the transport. Share the helper so the two paths
-        can't drift on effort resolution and clamping.
+        directly. Hermes Simple does not ship the LM Studio-specific adapter,
+        so omit the field here.
         """
-        from agent.lmstudio_reasoning import resolve_lmstudio_effort
-        return resolve_lmstudio_effort(
-            self.reasoning_config,
-            self._lmstudio_reasoning_options_cached(),
-        )
+        return None
 
     def _github_models_reasoning_extra_body(self) -> dict | None:
         """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
