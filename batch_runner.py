@@ -322,10 +322,6 @@ def _process_single_prompt(
             ephemeral_system_prompt=config.get("ephemeral_system_prompt"),
             log_prefix_chars=config.get("log_prefix_chars", 100),
             log_prefix=log_prefix,
-            providers_allowed=config.get("providers_allowed"),
-            providers_ignored=config.get("providers_ignored"),
-            providers_order=config.get("providers_order"),
-            provider_sort=config.get("provider_sort"),
             max_tokens=config.get("max_tokens"),
             reasoning_config=config.get("reasoning_config"),
             prefill_messages=config.get("prefill_messages"),
@@ -531,10 +527,6 @@ class BatchRunner:
         verbose: bool = False,
         ephemeral_system_prompt: str = None,
         log_prefix_chars: int = 100,
-        providers_allowed: List[str] = None,
-        providers_ignored: List[str] = None,
-        providers_order: List[str] = None,
-        provider_sort: str = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -556,10 +548,6 @@ class BatchRunner:
             verbose (bool): Enable verbose logging
             ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
             log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 20)
-            providers_allowed (List[str]): OpenRouter providers to allow (optional)
-            providers_ignored (List[str]): OpenRouter providers to ignore (optional)
-            providers_order (List[str]): OpenRouter providers to try in order (optional)
-            provider_sort (str): Sort providers by price/throughput/latency (optional)
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
             reasoning_config (Dict): OpenRouter reasoning config override (e.g. {"effort": "none"} to disable thinking)
             prefill_messages (List[Dict]): Messages to prepend as prefilled conversation context (few-shot priming).
@@ -580,10 +568,6 @@ class BatchRunner:
         self.verbose = verbose
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.log_prefix_chars = log_prefix_chars
-        self.providers_allowed = providers_allowed
-        self.providers_ignored = providers_ignored
-        self.providers_order = providers_order
-        self.provider_sort = provider_sort
         self.max_tokens = max_tokens
         self.reasoning_config = reasoning_config
         self.prefill_messages = prefill_messages
@@ -858,10 +842,6 @@ class BatchRunner:
             "verbose": self.verbose,
             "ephemeral_system_prompt": self.ephemeral_system_prompt,
             "log_prefix_chars": self.log_prefix_chars,
-            "providers_allowed": self.providers_allowed,
-            "providers_ignored": self.providers_ignored,
-            "providers_order": self.providers_order,
-            "provider_sort": self.provider_sort,
             "max_tokens": self.max_tokens,
             "reasoning_config": self.reasoning_config,
             "prefill_messages": self.prefill_messages,
@@ -1125,10 +1105,6 @@ def main(
     list_distributions: bool = False,
     ephemeral_system_prompt: str = None,
     log_prefix_chars: int = 100,
-    providers_allowed: str = None,
-    providers_ignored: str = None,
-    providers_order: str = None,
-    provider_sort: str = None,
     max_tokens: int = None,
     reasoning_effort: str = None,
     reasoning_disabled: bool = False,
@@ -1153,10 +1129,6 @@ def main(
         list_distributions (bool): List available toolset distributions and exit
         ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
         log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 20)
-        providers_allowed (str): Comma-separated list of OpenRouter providers to allow (e.g. "anthropic,openai")
-        providers_ignored (str): Comma-separated list of OpenRouter providers to ignore (e.g. "together,deepinfra")
-        providers_order (str): Comma-separated list of OpenRouter providers to try in order (e.g. "anthropic,openai,google")
-        provider_sort (str): Sort providers by "price", "throughput", or "latency" (OpenRouter only)
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
         reasoning_effort (str): OpenRouter reasoning effort level: "none", "minimal", "low", "medium", "high", "xhigh" (default: "medium")
         reasoning_disabled (bool): Completely disable reasoning/thinking tokens (default: False)
@@ -1213,11 +1185,6 @@ def main(
         print("❌ Error: --run_name is required")
         return
     
-    # Parse provider preferences (comma-separated strings to lists)
-    providers_allowed_list = [p.strip() for p in providers_allowed.split(",")] if providers_allowed else None
-    providers_ignored_list = [p.strip() for p in providers_ignored.split(",")] if providers_ignored else None
-    providers_order_list = [p.strip() for p in providers_order.split(",")] if providers_order else None
-    
     # Build reasoning_config from CLI flags
     # --reasoning_disabled takes priority, then --reasoning_effort, then default (medium)
     reasoning_config = None
@@ -1263,10 +1230,6 @@ def main(
             verbose=verbose,
             ephemeral_system_prompt=ephemeral_system_prompt,
             log_prefix_chars=log_prefix_chars,
-            providers_allowed=providers_allowed_list,
-            providers_ignored=providers_ignored_list,
-            providers_order=providers_order_list,
-            provider_sort=provider_sort,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
@@ -1284,4 +1247,3 @@ def main(
 
 if __name__ == "__main__":
     fire.Fire(main)
-

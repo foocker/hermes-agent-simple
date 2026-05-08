@@ -96,32 +96,6 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
-# OpenRouter Provider Routing (only applies when using OpenRouter)
-# =============================================================================
-# Control how requests are routed across providers on OpenRouter.
-# See: https://openrouter.ai/docs/guides/routing/provider-selection
-#
-# provider_routing:
-#   # Sort strategy: "price" (default), "throughput", or "latency"
-#   # Append :nitro to model name for a shortcut to throughput sorting.
-#   sort: "throughput"
-#
-#   # Only allow these providers (provider slugs from OpenRouter)
-#   # only: ["anthropic", "google"]
-#
-#   # Skip these providers entirely
-#   # ignore: ["deepinfra", "fireworks"]
-#
-#   # Try providers in this order (overrides default load balancing)
-#   # order: ["anthropic", "google", "together"]
-#
-#   # Require providers to support all parameters in your request
-#   # require_parameters: true
-#
-#   # Data policy: "allow" (default) or "deny" to exclude providers that may store data
-#   # data_collection: "deny"
-
-# =============================================================================
 # Git Worktree Isolation
 # =============================================================================
 # When enabled, each CLI session creates an isolated git worktree so multiple

@@ -18,7 +18,7 @@ source .venv/bin/activate
 ./hermes
 
 # 单次调用
-./hermes -z "你好，介绍一下当前项目"
+./hermes -z "1+1"
 
 # TUI
 ./hermes --tui

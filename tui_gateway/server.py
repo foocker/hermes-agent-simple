@@ -1688,14 +1688,6 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
         or None,
-        "providers_allowed": getattr(agent, "providers_allowed", None),
-        "providers_ignored": getattr(agent, "providers_ignored", None),
-        "providers_order": getattr(agent, "providers_order", None),
-        "provider_sort": getattr(agent, "provider_sort", None),
-        "provider_require_parameters": getattr(
-            agent, "provider_require_parameters", False
-        ),
-        "provider_data_collection": getattr(agent, "provider_data_collection", None),
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(),
@@ -3744,7 +3736,7 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     session = _sessions.get(params.get("session_id", ""))
     try:
-        # Gate: /reload-mcp invalidates the prompt cache for this session.
+        # Gate: /reload-mcp rebuilds the active tool set for this session.
         # Respect the ``approvals.mcp_reload_confirm`` config toggle — if
         # set (default true) AND the caller did not pass ``confirm=true``
         # in params, surface a warning to the transcript instead of just
@@ -3771,10 +3763,10 @@ def _(rid, params: dict) -> dict:
                 return _ok(rid, {
                     "status": "confirm_required",
                     "message": (
-                        "⚠️  /reload-mcp invalidates the prompt cache (next "
-                        "message re-sends full input tokens). Reply `/reload-mcp "
-                        "now` to proceed, or `/reload-mcp always` to proceed and "
-                        "silence this prompt permanently."
+                        "⚠️  /reload-mcp rebuilds the active tool set for this "
+                        "session. Reply `/reload-mcp now` to proceed, or "
+                        "`/reload-mcp always` to proceed and silence this prompt "
+                        "permanently."
                     ),
                 })
 

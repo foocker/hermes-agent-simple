@@ -57,15 +57,6 @@ OMIT_TEMPERATURE: object = object()
 
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-_OR_HEADERS = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-OpenRouter-Title": "Hermes Agent",
-    "X-OpenRouter-Categories": "productivity,cli-agent",
-}
-_AI_GATEWAY_HEADERS = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-}
 
 auxiliary_is_nous = False
 

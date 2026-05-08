@@ -1,9 +1,8 @@
-"""Remote model catalog fetcher.
+"""Optional remote model catalog fetcher.
 
-The Hermes docs site hosts a JSON manifest of curated models for providers
-we want to update without shipping a release (currently OpenRouter and
-Nous Portal). This module fetches, validates, and caches that manifest,
-falling back to the in-repo hardcoded lists when the network is unavailable.
+This module can fetch, validate, and cache a user-configured JSON manifest
+of curated models, falling back to the in-repo hardcoded lists when the
+network is unavailable or no URL is configured.
 
 Pipeline
 --------
@@ -62,7 +61,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_CATALOG_URL = (
-    "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json"
+    ""
 )
 DEFAULT_TTL_HOURS = 24
 DEFAULT_FETCH_TIMEOUT = 8.0
@@ -234,18 +233,20 @@ def get_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
         _catalog_cache_source_mtime = disk_mtime
         return disk_data
 
-    # Need to (re)fetch. If it fails, fall back to any stale disk copy.
-    fetched = _fetch_manifest(cfg["url"], DEFAULT_FETCH_TIMEOUT)
-    if fetched is not None:
-        _write_disk_cache(fetched)
-        new_disk_data, new_mtime = _read_disk_cache()
-        if new_disk_data is not None:
-            _catalog_cache = new_disk_data
-            _catalog_cache_source_mtime = new_mtime
-            return new_disk_data
-        _catalog_cache = fetched
-        _catalog_cache_source_mtime = now
-        return fetched
+    catalog_url = str(cfg.get("url") or "").strip()
+    if catalog_url:
+        # Need to (re)fetch. If it fails, fall back to any stale disk copy.
+        fetched = _fetch_manifest(catalog_url, DEFAULT_FETCH_TIMEOUT)
+        if fetched is not None:
+            _write_disk_cache(fetched)
+            new_disk_data, new_mtime = _read_disk_cache()
+            if new_disk_data is not None:
+                _catalog_cache = new_disk_data
+                _catalog_cache_source_mtime = new_mtime
+                return new_disk_data
+            _catalog_cache = fetched
+            _catalog_cache_source_mtime = now
+            return fetched
 
     if disk_data is not None:
         _catalog_cache = disk_data

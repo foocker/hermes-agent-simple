@@ -52,7 +52,6 @@ IGNORED_EMAILS = {
     "noreply@anthropic.com",
     "noreply@github.com",
     "cursoragent@cursor.com",
-    "hermes@nousresearch.com",
     "hermes-audit@example.com",
     "hermes@habibilabs.dev",
 }

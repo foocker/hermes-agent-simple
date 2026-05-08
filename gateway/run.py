@@ -224,7 +224,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
-from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
+from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -829,7 +829,6 @@ class GatewayRunner:
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
-        self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
         # Wire process registry into session store for reset protection
@@ -870,10 +869,8 @@ class GatewayRunner:
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
 
-        # Cache AIAgent instances per session to preserve prompt caching.
-        # Without this, a new AIAgent is created per message, rebuilding the
-        # system prompt (including memory) every turn — breaking prefix cache
-        # and costing ~10x more on providers with prompt caching (Anthropic).
+        # Cache AIAgent instances per session so memory, sessions, and
+        # runtime state survive across messages.
         # Key: session_key, Value: (AIAgent, config_signature_str)
         #
         # OrderedDict so _enforce_agent_cache_cap() can pop the least-recently-
@@ -1810,21 +1807,6 @@ class GatewayRunner:
             return "all"
         return mode
 
-    @staticmethod
-    def _load_provider_routing() -> dict:
-        """Load OpenRouter provider routing preferences from config.yaml."""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return cfg.get("provider_routing", {}) or {}
-        except Exception:
-            pass
-        return {}
-
-    @staticmethod
     def _load_fallback_model() -> list | dict | None:
         """Load fallback provider chain from config.yaml.
 
@@ -6522,14 +6504,6 @@ class GatewayRunner:
                 lines.append(f"Cost: {mi.format_cost()}")
             lines.append(f"Capabilities: {mi.format_capabilities()}")
 
-        # Cache notice
-        cache_enabled = (
-            (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
-            or result.api_mode == "anthropic_messages"
-        )
-        if cache_enabled:
-            lines.append("Prompt caching: enabled")
-
         if result.warning_message:
             lines.append(f"Warning: {result.warning_message}")
 
@@ -7233,7 +7207,6 @@ class GatewayRunner:
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
-            pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
@@ -7251,12 +7224,6 @@ class GatewayRunner:
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
-                    providers_allowed=pr.get("only"),
-                    providers_ignored=pr.get("ignore"),
-                    providers_order=pr.get("order"),
-                    provider_sort=pr.get("sort"),
-                    provider_require_parameters=pr.get("require_parameters", False),
-                    provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
@@ -8212,10 +8179,8 @@ class GatewayRunner:
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reload-mcp — reconnect MCP servers and rebuild the cached agent.
 
-        Reloading MCP tools invalidates the provider prompt cache for the
-        active session (tool schemas are baked into the system prompt).  The
-        next message re-sends full input tokens, which is expensive on
-        long-context or high-reasoning models.
+        Reloading MCP tools rebuilds the active session's tool set.  The
+        next message uses the refreshed schemas.
 
         To surface that cost, the command routes through the slash-confirm
         primitive: users get an Approve Once / Always Approve / Cancel
@@ -8269,10 +8234,8 @@ class GatewayRunner:
 
         prompt_message = (
             "⚠️ **Confirm /reload-mcp**\n\n"
-            "Reloading MCP servers rebuilds the tool set for this session "
-            "and **invalidates the provider prompt cache** — the next "
-            "message will re-send full input tokens.  On long-context or "
-            "high-reasoning models this can be expensive.\n\n"
+            "Reloading MCP servers rebuilds the tool set for this session. "
+            "The next message will use the refreshed schemas.\n\n"
             "Choose:\n"
             "• **Approve Once** — reload now\n"
             "• **Always Approve** — reload now and silence this prompt permanently\n"
@@ -10866,7 +10829,6 @@ class GatewayRunner:
                     "tools": [],
                 }
 
-            pr = self._provider_routing
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
@@ -11019,12 +10981,6 @@ class GatewayRunner:
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
-                    providers_allowed=pr.get("only"),
-                    providers_ignored=pr.get("ignore"),
-                    providers_order=pr.get("order"),
-                    provider_sort=pr.get("sort"),
-                    provider_require_parameters=pr.get("require_parameters", False),
-                    provider_data_collection=pr.get("data_collection"),
                     session_id=session_id,
                     platform=platform_key,
                     user_id=source.user_id,

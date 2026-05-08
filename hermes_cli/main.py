@@ -5888,8 +5888,7 @@ def main():
         description=(
             "Manage the fallback provider chain.  Fallback providers are tried "
             "in order when the primary model fails with rate-limit, overload, or "
-            "connection errors.  See: "
-            "https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers"
+            "connection errors."
         ),
     )
     fallback_subparsers = fallback_parser.add_subparsers(dest="fallback_command")
