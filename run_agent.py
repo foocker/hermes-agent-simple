@@ -1030,19 +1030,9 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
 
 
 
-
-
 # =========================================================================
 # Large tool result handler — save oversized output to temp file
 # =========================================================================
-
-
-# =========================================================================
-# Qwen Portal headers — mimics QwenCode CLI for portal.qwen.ai compatibility.
-# Extracted as a module-level helper so both __init__ and
-# _apply_client_headers_for_base_url can share it.
-# =========================================================================
-_QWEN_CODE_VERSION = "0.14.1"
 
 
 def _routermint_headers() -> dict:
@@ -1077,19 +1067,6 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
     if not pool.has_available():
         return False
     return len(pool.entries()) > 1
-
-
-def _qwen_portal_headers() -> dict:
-    """Return default HTTP headers required by Qwen Portal API."""
-    import platform as _plat
-
-    _ua = f"QwenCode/{_QWEN_CODE_VERSION} ({_plat.system().lower()}; {_plat.machine()})"
-    return {
-        "User-Agent": _ua,
-        "X-DashScope-CacheControl": "enable",
-        "X-DashScope-UserAgent": _ua,
-        "X-DashScope-AuthType": "qwen-oauth",
-    }
 
 
 class AIAgent:
@@ -1258,17 +1235,12 @@ class AIAgent:
             raise ValueError(f"Unsupported api_mode for Hermes Simple: {api_mode}")
         elif self.provider == "openai-codex":
             self.api_mode = "codex_responses"
-        elif self.provider == "xai":
-            self.api_mode = "codex_responses"
         elif (provider_name is None) and (
             self._base_url_hostname == "chatgpt.com"
             and "/backend-api/codex" in self._base_url_lower
         ):
             self.api_mode = "codex_responses"
             self.provider = "openai-codex"
-        elif (provider_name is None) and self._base_url_hostname == "api.x.ai":
-            self.api_mode = "codex_responses"
-            self.provider = "xai"
         else:
             self.api_mode = "chat_completions"
 
@@ -1917,10 +1889,6 @@ class AIAgent:
         # AFTER the custom_providers branch so per-model overrides aren't lost.
         self._config_context_length = _config_context_length
 
-        self._ensure_lmstudio_runtime_loaded(_config_context_length)
-
-
-
         # Select context engine: config-driven (like memory providers).
         # 1. Check config.yaml context.engine setting
         # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
@@ -1962,6 +1930,7 @@ class AIAgent:
         if _selected_engine is not None:
             self.context_compressor = _selected_engine
             # Resolve context_length for plugin engines — mirrors switch_model() path
+            # TODO 去掉其他模型的context_length配置 简化
             from agent.model_metadata import get_model_context_length
             _plugin_ctx_len = get_model_context_length(
                 self.model,
@@ -2153,39 +2122,6 @@ class AIAgent:
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.on_session_reset()
 
-    def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
-        """
-        Preload the LM Studio model with at least Hermes' minimum context.
-        """
-        if (self.provider or "").strip().lower() != "lmstudio":
-            return
-        try:
-            from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
-            from hermes_cli.models import ensure_lmstudio_model_loaded
-            if config_context_length is None:
-                config_context_length = getattr(self, "_config_context_length", None)
-            target_ctx = max(config_context_length or 0, MINIMUM_CONTEXT_LENGTH)
-            loaded_ctx = ensure_lmstudio_model_loaded(
-                self.model, self.base_url, getattr(self, "api_key", ""), target_ctx,
-            )
-            if loaded_ctx:
-                # Push into the live compressor so the status bar reflects the
-                # real loaded ctx the moment the load resolves, instead of
-                # holding the previous model's value (or "ctx --") through the
-                # next render tick.
-                cc = getattr(self, "context_compressor", None)
-                if cc is not None:
-                    cc.update_model(
-                        model=self.model,
-                        context_length=loaded_ctx,
-                        base_url=self.base_url,
-                        api_key=getattr(self, "api_key", ""),
-                        provider=self.provider,
-                        api_mode=self.api_mode,
-                    )
-        except Exception as err:
-            logger.debug("LM Studio preload skipped: %s", err)
-
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
 
@@ -2235,9 +2171,6 @@ class AIAgent:
             reason="switch_model",
             shared=True,
         )
-
-        # ── LM Studio: preload before probing context length ──
-        self._ensure_lmstudio_runtime_loaded()
 
         # ── Update context compressor ──
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -2884,46 +2817,6 @@ class AIAgent:
             return True
         return stripped[-1] in '.!?:)"\']}。！？：）】」』》'
 
-    def _is_ollama_glm_backend(self) -> bool:
-        """Detect the narrow backend family affected by Ollama/GLM stop misreports."""
-        model_lower = (self.model or "").lower()
-        provider_lower = (self.provider or "").lower()
-        if "glm" not in model_lower and provider_lower != "zai":
-            return False
-        if "ollama" in self._base_url_lower or ":11434" in self._base_url_lower:
-            return True
-        return bool(self.base_url and is_local_endpoint(self.base_url))
-
-    def _should_treat_stop_as_truncated(
-        self,
-        finish_reason: str,
-        assistant_message,
-        messages: Optional[list] = None,
-    ) -> bool:
-        """Detect conservative stop->length misreports for Ollama-hosted GLM models."""
-        if finish_reason != "stop" or self.api_mode != "chat_completions":
-            return False
-        if not self._is_ollama_glm_backend():
-            return False
-        if not any(
-            isinstance(msg, dict) and msg.get("role") == "tool"
-            for msg in (messages or [])
-        ):
-            return False
-        if assistant_message is None or getattr(assistant_message, "tool_calls", None):
-            return False
-
-        content = getattr(assistant_message, "content", None)
-        if not isinstance(content, str):
-            return False
-
-        visible_text = self._strip_think_blocks(content).strip()
-        if not visible_text:
-            return False
-        if len(visible_text) < 20 or not re.search(r"\s", visible_text):
-            return False
-
-        return not self._has_natural_response_ending(visible_text)
 
     def _looks_like_codex_intermediate_ack(
         self,
@@ -6912,9 +6805,6 @@ class AIAgent:
                 # not only after a later credential-rotation rebuild.
                 self._replace_primary_openai_client(reason="fallback_timeout_apply")
 
-            # LM Studio: preload before probing the fallback's context length.
-            self._ensure_lmstudio_runtime_loaded()
-
             # Update context compressor limits for the fallback model.
             # Without this, compression decisions use the primary model's
             # context window (e.g. 200K) instead of the fallback's (e.g. 32K),
@@ -9359,7 +9249,6 @@ class AIAgent:
             api_start_time = time.time()
             retry_count = 0
             max_retries = self._api_max_retries
-            primary_recovery_attempted = False
             max_compression_attempts = 3
             thinking_sig_retry_attempted = False
             image_shrink_retry_attempted = False
@@ -9561,7 +9450,6 @@ class AIAgent:
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
-                            primary_recovery_attempted = False
                             continue
 
                         # Check for error field in response (some providers include this)
@@ -9631,7 +9519,6 @@ class AIAgent:
                             if self._try_activate_fallback():
                                 retry_count = 0
                                 compression_attempts = 0
-                                primary_recovery_attempted = False
                                 continue
                             self._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                             logging.error(f"{self.log_prefix}Invalid API response after {max_retries} retries.")
@@ -9692,16 +9579,6 @@ class AIAgent:
                         _finish_result = _normalize_chat_response(response)
                         finish_reason = _finish_result.finish_reason
                         assistant_message = _finish_result
-                        if self._should_treat_stop_as_truncated(
-                            finish_reason,
-                            assistant_message,
-                            messages,
-                        ):
-                            self._vprint(
-                                f"{self.log_prefix}⚠️  Treating suspicious Ollama/GLM stop response as truncated",
-                                force=True,
-                            )
-                            finish_reason = "length"
 
                     if finish_reason == "length":
                         self._vprint(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
@@ -10449,7 +10326,6 @@ class AIAgent:
                             if self._try_activate_fallback(reason=classified.reason):
                                 retry_count = 0
                                 compression_attempts = 0
-                                primary_recovery_attempted = False
                                 continue
 
                     is_payload_too_large = (
@@ -10694,7 +10570,6 @@ class AIAgent:
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
-                            primary_recovery_attempted = False
                             continue
                         if api_kwargs is not None:
                             self._dump_api_request_debug(
@@ -10746,22 +10621,11 @@ class AIAgent:
                         }
 
                     if retry_count >= max_retries:
-                        # Before falling back, try rebuilding the primary
-                        # client once for transient transport errors (stale
-                        # connection pool, TCP reset).  Only attempted once
-                        # per API call block.
-                        if not primary_recovery_attempted and self._try_recover_primary_transport(
-                            api_error, retry_count=retry_count, max_retries=max_retries,
-                        ):
-                            primary_recovery_attempted = True
-                            retry_count = 0
-                            continue
                         # Try fallback before giving up entirely
                         self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
-                            primary_recovery_attempted = False
                             continue
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
