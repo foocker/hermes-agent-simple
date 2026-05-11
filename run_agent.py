@@ -136,7 +136,6 @@ from agent.model_metadata import (
     get_next_probe_tier, parse_context_limit_from_error,
     parse_available_output_tokens_from_error,
     save_context_length, is_local_endpoint,
-    query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -2022,32 +2021,6 @@ class AIAgent:
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         
-        # ── Ollama num_ctx injection ──
-        # Ollama defaults to 2048 context regardless of the model's capabilities.
-        # When running against an Ollama server, detect the model's max context
-        # and pass num_ctx on every chat request so the full window is used.
-        # User override: set model.ollama_num_ctx in config.yaml to cap VRAM use.
-        self._ollama_num_ctx: int | None = None
-        _ollama_num_ctx_override = None
-        if isinstance(_model_cfg, dict):
-            _ollama_num_ctx_override = _model_cfg.get("ollama_num_ctx")
-        if _ollama_num_ctx_override is not None:
-            try:
-                self._ollama_num_ctx = int(_ollama_num_ctx_override)
-            except (TypeError, ValueError):
-                logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-        if self._ollama_num_ctx is None and self.base_url and is_local_endpoint(self.base_url):
-            try:
-                _detected = query_ollama_num_ctx(self.model, self.base_url, api_key=self.api_key or "")
-                if _detected and _detected > 0:
-                    self._ollama_num_ctx = _detected
-            except Exception as exc:
-                logger.debug("Ollama num_ctx detection failed: %s", exc)
-        if self._ollama_num_ctx and not self.quiet_mode:
-            logger.info(
-                "Ollama num_ctx: will request %d tokens (model max from /api/show)",
-                self._ollama_num_ctx,
-            )
 
         if not self.quiet_mode:
             if compression_enabled:
@@ -5609,10 +5582,6 @@ class AIAgent:
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
         if base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
-        elif base_url_host_matches(base_url, "api.kimi.com"):
-            self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
-        elif base_url_host_matches(base_url, "portal.qwen.ai"):
-            self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):
             from agent.auxiliary_client import _codex_cloudflare_headers
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
@@ -7008,17 +6977,6 @@ class AIAgent:
             return api_messages
 
         transformed = copy.deepcopy(api_messages)
-        for msg in transformed:
-            if not isinstance(msg, dict):
-                continue
-            # Reuse the Anthropic text-fallback preprocessor — the behaviour is
-            # identical (walk content parts, replace images with cached
-            # descriptions, merge back into a single text or structured
-            # content). Naming is historical.
-            msg["content"] = self._preprocess_anthropic_content(
-                msg.get("content"),
-                str(msg.get("role", "user") or "user"),
-            )
         return transformed
 
     def _try_shrink_image_parts_in_messages(self, api_messages: list) -> bool:
@@ -8487,8 +8445,6 @@ class AIAgent:
         # applied to sequential execution as well.
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
-
-
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
